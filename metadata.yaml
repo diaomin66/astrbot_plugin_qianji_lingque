@@ -1,0 +1,10 @@
+name: astrbot_plugin_qianji_lingque
+display_name: 千机聆阙
+desc: 在群聊中通过上下文判断是否应当回复，让 AstrBot 更会读空气。
+short_desc: 群聊读空气与本地灰区跳过
+version: v0.1.0
+author: 雪碧bir
+repo: https://github.com/diaomin66/astrbot_plugin_qianji_lingque
+astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp

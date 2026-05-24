@@ -1,0 +1,101 @@
+{
+  "enabled": {
+    "description": "启用千机聆阙",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后插件不会监听群聊读空气。"
+  },
+  "enabled_groups": {
+    "description": "启用的群聊 ID",
+    "type": "list",
+    "default": [],
+    "hint": "留空表示所有群聊启用；填写后仅这些群聊生效。"
+  },
+  "disabled_groups": {
+    "description": "禁用的群聊 ID",
+    "type": "list",
+    "default": [],
+    "hint": "用于在 enabled_groups 留空时关闭少数群；也会覆盖白名单。"
+  },
+  "mode": {
+    "description": "默认回复积极度",
+    "type": "string",
+    "default": "普通",
+    "options": ["安静", "普通", "积极"],
+    "hint": "quiet 更克制，normal 平衡，active 更积极。"
+  },
+  "group_modes": {
+    "description": "群聊回复积极度覆盖",
+    "type": "list",
+    "default": [],
+    "invisible": true,
+    "hint": "由 /读空气 模式 写入。单实例通常是 群号=quiet|normal|active；多 aiocqhttp 实例会写入 平台实例ID:群号=quiet|normal|active。"
+  },
+  "max_context_messages": {
+    "description": "每个群保留的最近消息数",
+    "type": "int",
+    "default": 24,
+    "slider": {"min": 4, "max": 100, "step": 1},
+    "hint": "用于读空气和回复生成的短期上下文窗口。"
+  },
+  "merge_window_seconds": {
+    "description": "连续发言等待窗口",
+    "type": "float",
+    "default": 1.2,
+    "slider": {"min": 0, "max": 10, "step": 0.1},
+    "hint": "用户连续发言时先等待，避免打断。"
+  },
+  "min_reply_interval_seconds": {
+    "description": "同群最短回复间隔",
+    "type": "float",
+    "default": 18.0,
+    "slider": {"min": 0, "max": 600, "step": 1},
+    "hint": "控制 bot 不要在同一群过于频繁插话。"
+  },
+  "bot_cooldown_after_reply_seconds": {
+    "description": "bot 回复后的冷却时间",
+    "type": "float",
+    "default": 35.0,
+    "slider": {"min": 0, "max": 1200, "step": 1},
+    "hint": "刚回复后默认更克制，除非被明确点名或追问。"
+  },
+  "reply_timeout_seconds": {
+    "description": "回复生成兜底超时",
+    "type": "float",
+    "default": 12.0,
+    "slider": {"min": 1, "max": 60, "step": 1},
+    "hint": "用于清理长时间未收到 LLM 响应的 pending 状态。"
+  },
+  "score_threshold_reply": {
+    "description": "直接回复分数阈值",
+    "type": "float",
+    "default": 0.78,
+    "slider": {"min": 0, "max": 1, "step": 0.01},
+    "hint": "本地评分高于该值时直接回复；灰区消息会快速跳过或仅在被点名时回复。"
+  },
+  "score_threshold_ignore": {
+    "description": "直接忽略分数阈值",
+    "type": "float",
+    "default": 0.35,
+    "slider": {"min": 0, "max": 1, "step": 0.01},
+    "hint": "本地评分低于该值时不调用模型。"
+  },
+  "debug_explain_enabled": {
+    "description": "允许查看最近判定原因",
+    "type": "bool",
+    "default": true,
+    "hint": "启用后可用 /读空气 原因 查看最近一次判定。"
+  },
+  "takeover_explicit_mentions": {
+    "description": "接管明确点名",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后消息链 @ 或引用 bot 的回复会阻止默认 LLM 链路，避免重复回答。"
+  },
+  "bot_aliases": {
+    "description": "bot 昵称",
+    "type": "list",
+    "default": ["机器人", "小助手"],
+    "hint": "群聊中出现这些称呼会提高回复概率。"
+  }
+}
