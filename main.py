@@ -8,8 +8,12 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 
-from qianji_lingque.config import PluginConfig
-from qianji_lingque.runtime import QianjiLingqueRuntime
+if __package__:
+    from .qianji_lingque.config import PluginConfig
+    from .qianji_lingque.runtime import QianjiLingqueRuntime
+else:
+    from qianji_lingque.config import PluginConfig
+    from qianji_lingque.runtime import QianjiLingqueRuntime
 
 
 class QianjiLingquePlugin(Star):

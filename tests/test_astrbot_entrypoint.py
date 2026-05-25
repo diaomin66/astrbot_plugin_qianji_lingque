@@ -1,14 +1,55 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import unittest
 from pathlib import Path
 
 
 class AstrBotEntrypointSmokeTests(unittest.TestCase):
+    def test_main_imports_when_loaded_from_astrbot_plugin_package_path(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        sdk_path = repo_root / ".venv" / "Lib" / "site-packages"
+        if not (sdk_path / "astrbot").exists():
+            self.skipTest("AstrBot SDK is not available in the local isolated test path")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            plugin_dir = temp_root / "data" / "plugins" / "astrbot_plugin_qianji_lingque"
+            plugin_dir.mkdir(parents=True)
+            shutil.copy2(repo_root / "main.py", plugin_dir / "main.py")
+            shutil.copytree(repo_root / "qianji_lingque", plugin_dir / "qianji_lingque")
+
+            script = textwrap.dedent(
+                """
+                import data.plugins.astrbot_plugin_qianji_lingque.main as plugin_main
+                from data.plugins.astrbot_plugin_qianji_lingque.qianji_lingque.config import PluginConfig
+                from data.plugins.astrbot_plugin_qianji_lingque.qianji_lingque.runtime import QianjiLingqueRuntime
+
+                assert plugin_main.__package__ == "data.plugins.astrbot_plugin_qianji_lingque"
+                assert PluginConfig is not None
+                assert QianjiLingqueRuntime is not None
+                print("astrbot package import ok")
+                """
+            )
+            env = dict(os.environ)
+            env["PYTHONPATH"] = os.pathsep.join([str(sdk_path), str(temp_root)])
+            completed = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=temp_root,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=60,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+        self.assertIn("astrbot package import ok", completed.stdout)
+
     def test_main_imports_and_registers_chinese_commands_when_sdk_is_available(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         sdk_path = repo_root / ".venv" / "Lib" / "site-packages"
