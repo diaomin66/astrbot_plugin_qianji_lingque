@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 import uuid
@@ -12,6 +13,11 @@ from .decision import DecisionEngine
 from .config import PluginConfig, mode_label, parse_mode
 from .event_utils import group_id_from_event, snapshot_from_event
 from .llm import LLMClient, extract_chain_text
+
+try:
+    from astrbot.api import logger
+except ImportError:
+    logger = logging.getLogger("astrbot_plugin_qianji_lingque")
 
 try:
     from astrbot.core.astr_main_agent_resources import (
@@ -88,6 +94,7 @@ class QianjiLingqueRuntime:
 
     async def handle_group_message(self, event: Any) -> AsyncIterator[Any]:
         if not _is_supported_platform(event):
+            self._log_decision(event, action="ignore", will_call_llm=False, reason="平台不支持，仅支持 aiocqhttp。")
             if False:
                 yield None
             return
@@ -98,20 +105,46 @@ class QianjiLingqueRuntime:
             group_ttl_seconds=self.config.group_ttl_seconds,
         )
         if _event_has_send_operation(event) and not _get_pending_payload(event):
+            self._log_decision(event, action="ignore", will_call_llm=False, reason="事件已有发送动作，避免重复处理。")
             if False:
                 yield None
             return
         snapshot = snapshot_from_event(event, self.config.bot_aliases)
         if _looks_like_chat_command(snapshot.text):
+            self._log_decision(
+                event,
+                action="ignore",
+                will_call_llm=False,
+                reason="识别为指令或其他插件命令，交给命令链路。",
+                group_id=snapshot.group_id,
+                text=snapshot.text,
+            )
             if False:
                 yield None
             return
         if _get_raw_extra(event, EXTERNAL_LLM_REQUEST_EXTRA_KEY):
+            self._log_decision(
+                event,
+                action="ignore",
+                will_call_llm=False,
+                reason="同一事件已有其他链路请求 LLM，本插件避让。",
+                group_id=snapshot.group_id,
+                text=snapshot.text,
+            )
             if False:
                 yield None
             return
         group_key = _state_group_id(event, snapshot.group_id)
         if not snapshot.group_id or not _is_group_enabled(self.config, snapshot.group_id, group_key):
+            self._log_decision(
+                event,
+                action="ignore",
+                will_call_llm=False,
+                reason="插件未在当前群启用或缺少群号。",
+                group_id=snapshot.group_id,
+                state_group_id=group_key,
+                text=snapshot.text,
+            )
             if False:
                 yield None
             return
@@ -142,6 +175,16 @@ class QianjiLingqueRuntime:
             and (snapshot.is_explicit_to_bot or getattr(event, "is_at_or_wake_command", False))
         ):
             state.last_decision = "ignore (0.00)：明确点名接管已关闭，交给 AstrBot 默认链路。"
+            self._log_decision(
+                event,
+                action="ignore",
+                will_call_llm=False,
+                reason="明确点名接管已关闭，交给 AstrBot 默认链路。",
+                confidence=0.0,
+                group_id=snapshot.group_id,
+                state_group_id=group_key,
+                text=snapshot.text,
+            )
             if False:
                 yield None
             return
@@ -149,6 +192,16 @@ class QianjiLingqueRuntime:
         if final_action != "reply":
             if _should_record_context(decision):
                 state.append_user_message(decision_snapshot)
+            self._log_decision(
+                event,
+                action=final_action,
+                will_call_llm=False,
+                reason=final_reason,
+                confidence=decision.confidence,
+                group_id=snapshot.group_id,
+                state_group_id=group_key,
+                text=snapshot.text,
+            )
             if False:
                 yield None
             return
@@ -161,6 +214,16 @@ class QianjiLingqueRuntime:
             if _should_record_context(decision):
                 state.append_user_message(decision_snapshot)
             suppress_default = take_over_event or bool(getattr(event, "is_at_or_wake_command", False))
+            self._log_decision(
+                event,
+                action="wait",
+                will_call_llm=False,
+                reason="同群已有回复生成中，本轮不再调用 LLM。",
+                confidence=decision.confidence,
+                group_id=snapshot.group_id,
+                state_group_id=group_key,
+                text=snapshot.text,
+            )
             if suppress_default:
                 _suppress_default_llm(event)
                 yield event.plain_result("上一条还在生成，我先不叠加请求。")
@@ -194,6 +257,16 @@ class QianjiLingqueRuntime:
             _clear_qianji_extra(event)
             detail = self.llm_client.last_error or "无法取得 AstrBot 会话。"
             state.last_decision = f"ignore (0.00)：{detail} 已放弃本轮回复。"
+            self._log_decision(
+                event,
+                action="ignore",
+                will_call_llm=False,
+                reason=f"{detail} 已放弃本轮回复。",
+                confidence=0.0,
+                group_id=snapshot.group_id,
+                state_group_id=group_key,
+                text=snapshot.text,
+            )
             if False:
                 yield None
             return
@@ -201,6 +274,16 @@ class QianjiLingqueRuntime:
             self._cancel_timers_for_token(token)
             _clear_qianji_extra(event)
             state.last_decision = "ignore (0.00)：回复构建已被更新的直接请求抢占。"
+            self._log_decision(
+                event,
+                action="ignore",
+                will_call_llm=False,
+                reason="回复构建已被更新的直接请求抢占。",
+                confidence=0.0,
+                group_id=snapshot.group_id,
+                state_group_id=group_key,
+                text=snapshot.text,
+            )
             if False:
                 yield None
             return
@@ -237,6 +320,17 @@ class QianjiLingqueRuntime:
         self._schedule_pending_expiry(token, replace=True)
         _suppress_default_llm(event)
         state.last_decision = f"reply ({decision.confidence:.2f})：{final_reason}"
+        self._log_decision(
+            event,
+            action="reply",
+            will_call_llm=True,
+            reason=final_reason,
+            confidence=decision.confidence,
+            group_id=snapshot.group_id,
+            state_group_id=group_key,
+            text=snapshot.text,
+            request_id=request_id,
+        )
         try:
             yield reply_request
         finally:
@@ -249,6 +343,14 @@ class QianjiLingqueRuntime:
                 self._cleanup_pending_event(token, pending_after_agent)
                 _clear_qianji_extra(event)
                 state.last_decision = "ignore (0.00)：AstrBot 未确认 LLM 请求，已清理 pending。"
+                self._log_lifecycle(
+                    "LLM请求未确认",
+                    event,
+                    group_id=group_key,
+                    token=token,
+                    request_id=request_id,
+                    detail="实际调用LLM=否；AstrBot 未触发 on_llm_request，已清理 pending。",
+                )
             elif pending_after_agent is None:
                 self._cancel_timers_for_token(token)
                 self._pending_events.pop(token, None)
@@ -276,6 +378,14 @@ class QianjiLingqueRuntime:
         ):
             return
         _disable_provider_request_tools(request)
+        self._log_lifecycle(
+            "LLM请求确认",
+            event,
+            group_id=group_id,
+            token=token,
+            request_id=request_id,
+            detail="实际调用LLM=是；本插件请求已进入 AstrBot ProviderRequest；已关闭工具调用以避免读空气回复误触发工具。",
+        )
         self._pending_replies[token] = PendingReply(
             group_id=group_id,
             token=token,
@@ -311,6 +421,14 @@ class QianjiLingqueRuntime:
             state = self.context_store.peek_group(group_id)
             if state is not None:
                 state.last_decision = "ignore (0.00)：AstrBot 会话模型返回错误，等待发送阶段收尾。"
+            self._log_lifecycle(
+                "LLM响应错误",
+                event,
+                group_id=group_id,
+                token=token,
+                request_id=pending.request_id,
+                detail="模型响应 role=err，等待发送阶段收尾。",
+            )
             self._pending_replies[token] = PendingReply(
                 group_id=pending.group_id,
                 token=pending.token,
@@ -331,6 +449,14 @@ class QianjiLingqueRuntime:
             state = self.context_store.peek_group(group_id)
             if state is not None:
                 state.last_decision = "ignore (0.00)：AstrBot 会话模型未生成有效文本回复。"
+            self._log_lifecycle(
+                "LLM空响应",
+                event,
+                group_id=group_id,
+                token=token,
+                request_id=pending.request_id,
+                detail="模型未生成可见文本回复。",
+            )
             self._pending_replies[token] = PendingReply(
                 group_id=pending.group_id,
                 token=pending.token,
@@ -358,6 +484,14 @@ class QianjiLingqueRuntime:
             previous_streaming=pending.previous_streaming,
             had_send_before=pending.had_send_before,
         )
+        self._log_lifecycle(
+            "LLM响应完成",
+            event,
+            group_id=group_id,
+            token=token,
+            request_id=pending.request_id,
+            detail=f"模型已产出可见文本，长度={len(reply_text)}。",
+        )
         self._schedule_send_confirmation_expiry(token)
 
     def record_after_message_sent(self, event: Any) -> None:
@@ -384,9 +518,23 @@ class QianjiLingqueRuntime:
         _clear_qianji_extra(event)
         if pending is None or pending.group_id != group_id:
             self._sync_protected_context_groups()
+            self._log_lifecycle(
+                "发送确认忽略",
+                event,
+                group_id=group_id,
+                token=token,
+                detail="发送钩子中的 pending 已不存在或群 key 不匹配。",
+            )
             return
         if pending.status not in {"active", "responded", "empty_response", "error_response", "timed_out"}:
             self._sync_protected_context_groups()
+            self._log_lifecycle(
+                "发送确认忽略",
+                event,
+                group_id=group_id,
+                token=token,
+                detail=f"pending 状态 {pending.status} 不需要发送收尾。",
+            )
             return
 
         state = self.context_store.peek_group(group_id)
@@ -424,6 +572,14 @@ class QianjiLingqueRuntime:
                 state.last_decision = "ignore (0.00)：AstrBot 会话模型返回错误，已进入冷却但不写入群聊上下文。"
             else:
                 state.last_decision = "ignore (0.00)：发送阶段未确认发出消息，未写入群聊上下文。"
+            self._log_lifecycle(
+                "发送未确认",
+                event,
+                group_id=group_id,
+                token=token,
+                request_id=pending.request_id,
+                detail=f"未确认本插件请求后发出消息，pending_status={pending.status}。",
+            )
             return
         if (
             pending.status in {"active", "error_response"}
@@ -432,15 +588,39 @@ class QianjiLingqueRuntime:
         ):
             state.mark_bot_attempt(time.time())
             state.last_decision = "ignore (0.00)：AstrBot 会话模型未返回正常响应，已进入冷却但不写入群聊上下文。"
+            self._log_lifecycle(
+                "发送异常",
+                event,
+                group_id=group_id,
+                token=token,
+                request_id=pending.request_id,
+                detail=f"发送文本像错误或 pending_status={pending.status}，不写入群聊上下文。",
+            )
             return
         if not sent_text:
             sent_text = pending.response_text
         if not sent_text:
             state.mark_bot_attempt(time.time())
             state.last_decision = "ignore (0.00)：发送后未发现可记录的文本回复，已进入冷却。"
+            self._log_lifecycle(
+                "发送空文本",
+                event,
+                group_id=group_id,
+                token=token,
+                request_id=pending.request_id,
+                detail="发送钩子触发但未找到可记录文本。",
+            )
             return
         state.append_bot_reply(sent_text, time.time())
         state.last_decision = f"reply ({pending.confidence:.2f})：{pending.reason}"
+        self._log_lifecycle(
+            "发送确认",
+            event,
+            group_id=group_id,
+            token=token,
+            request_id=pending.request_id,
+            detail=f"已记录 bot 回复，长度={len(sent_text)}。",
+        )
 
     def _should_take_over_event(self, event: Any, snapshot: Any) -> bool:
         return bool(
@@ -572,19 +752,40 @@ class QianjiLingqueRuntime:
             )
             if state is not None:
                 state.last_decision = "wait (0.00)：回复状态超时，保留晚到发送记录并继续节流。"
+            event = self._pending_events.get(token)
+            if event is not None:
+                self._log_lifecycle(
+                    "LLM等待超时",
+                    event,
+                    group_id=pending.group_id,
+                    token=token,
+                    request_id=pending.request_id,
+                    detail="LLM 响应超过回复生成兜底时间，继续等待晚到发送确认。",
+                )
             self._schedule_pending_expiry(token, replace=True)
             return
         if pending.status in {"responded", "empty_response", "error_response"}:
             self._finalize_unconfirmed_response(token, pending)
             return
+        event = self._pending_events.get(token)
         self._pending_replies.pop(token, None)
         self._sync_protected_context_groups()
         self._cancel_timers_for_token(token)
         self._cleanup_pending_event(token, pending)
         if state is not None:
             state.last_decision = "ignore (0.00)：回复状态超时，已清理 pending。"
+        if event is not None:
+            self._log_lifecycle(
+                "LLM状态超时清理",
+                event,
+                group_id=pending.group_id,
+                token=token,
+                request_id=pending.request_id,
+                detail=f"pending_status={pending.status} 已超时清理。",
+            )
 
     def _finalize_unconfirmed_response(self, token: str, pending: PendingReply) -> None:
+        event = self._pending_events.get(token)
         self._pending_replies.pop(token, None)
         self._cancel_timers_for_token(token)
         self._cleanup_pending_event(token, pending)
@@ -602,6 +803,15 @@ class QianjiLingqueRuntime:
             state.last_decision = "ignore (0.00)：模型返回错误且发送钩子未触发，已进入冷却并清理 pending。"
         else:
             state.last_decision = "ignore (0.00)：模型空回复且发送钩子未触发，已进入冷却并清理 pending。"
+        if event is not None:
+            self._log_lifecycle(
+                "发送确认超时清理",
+                event,
+                group_id=pending.group_id,
+                token=token,
+                request_id=pending.request_id,
+                detail=f"pending_status={pending.status}，发送钩子未触发。",
+            )
 
     def _cleanup_pending_event(self, token: str, pending: PendingReply) -> None:
         event = self._pending_events.pop(token, None)
@@ -633,6 +843,12 @@ class QianjiLingqueRuntime:
         if sent_text:
             state.append_bot_context(sent_text, time.time())
         state.mark_bot_attempt(time.time())
+        self._log_lifecycle(
+            "外部发送记录",
+            event,
+            group_id=group_id,
+            detail=f"其他链路已发送消息，长度={len(sent_text)}。",
+        )
 
     def record_external_llm_request(self, event: Any) -> None:
         if not self._should_track_external_event(event):
@@ -644,6 +860,12 @@ class QianjiLingqueRuntime:
         _set_extra(event, EXTERNAL_LLM_REQUEST_EXTRA_KEY, True)
         if state is not None:
             state.mark_bot_attempt(time.time())
+        self._log_lifecycle(
+            "外部LLM请求",
+            event,
+            group_id=group_id,
+            detail="同群其他链路请求 LLM，本插件记录冷却并避让。",
+        )
 
     def record_external_llm_response(self, event: Any, response: Any) -> None:
         if not self._should_track_external_event(event):
@@ -661,6 +883,12 @@ class QianjiLingqueRuntime:
         if reply_text or role == "err":
             state.mark_bot_attempt(time.time())
             _set_extra(event, EXTERNAL_LLM_EXTRA_KEY, True)
+            self._log_lifecycle(
+                "外部LLM响应",
+                event,
+                group_id=group_id,
+                detail=f"其他链路 LLM 响应 role={role or 'normal'}，文本长度={len(reply_text)}。",
+            )
 
     def terminate(self) -> None:
         for handle in list(self._timer_handles):
@@ -775,9 +1003,89 @@ class QianjiLingqueRuntime:
                     break
         self.context_store.set_protected_groups(protected_group_ids)
 
+    def _log_decision(
+        self,
+        event: Any,
+        *,
+        action: str,
+        will_call_llm: bool,
+        reason: str,
+        confidence: float | None = None,
+        group_id: str = "",
+        state_group_id: str = "",
+        text: str = "",
+        request_id: int = 0,
+    ) -> None:
+        if not self.config.log_decisions_enabled:
+            return
+        group_id = group_id or _get_group_id(event) or "未知"
+        state_group_id = state_group_id or group_id
+        score = "无" if confidence is None else f"{confidence:.2f}"
+        extra = f" request_id={request_id}" if request_id else ""
+        log_method = logger.info if will_call_llm else logger.debug
+        log_method(
+            "[千机聆阙] 判定 动作=%s 计划调用LLM=%s 分数=%s 群=%s 状态key=%s 平台=%s 发送者=%s 原因=%s 消息=%s%s",
+            action,
+            "是" if will_call_llm else "否",
+            score,
+            group_id,
+            state_group_id,
+            _event_platform_id(event) or _event_platform_name(event) or "未知",
+            _event_sender_id(event) or "未知",
+            _compact_log_text(reason, 160),
+            self._log_message_summary(text or _message_text_from_event(event)),
+            extra,
+        )
+
+    def _log_lifecycle(
+        self,
+        stage: str,
+        event: Any,
+        *,
+        group_id: str = "",
+        token: str = "",
+        request_id: int = 0,
+        detail: str = "",
+    ) -> None:
+        if not self.config.log_decisions_enabled:
+            return
+        logger.info(
+            "[千机聆阙] %s 群=%s 平台=%s 发送者=%s token=%s request_id=%s 详情=%s",
+            stage,
+            group_id or _get_group_id(event) or "未知",
+            _event_platform_id(event) or _event_platform_name(event) or "未知",
+            _event_sender_id(event) or "未知",
+            token or "无",
+            request_id or "无",
+            _compact_log_text(detail, 200),
+        )
+
+    def _log_message_summary(self, text: str) -> str:
+        compact = " ".join(str(text or "").split())
+        if self.config.log_message_excerpt_enabled:
+            return _compact_log_text(compact, 80)
+        return f"已隐藏(长度={len(compact)})"
+
 
 def _get_group_id(event: Any) -> str:
     return group_id_from_event(event)
+
+
+def _event_sender_id(event: Any) -> str:
+    getter = getattr(event, "get_sender_id", None)
+    if callable(getter):
+        try:
+            return str(getter() or "").strip()
+        except Exception:
+            return ""
+    return str(getattr(event, "sender_id", "") or "").strip()
+
+
+def _compact_log_text(text: str, limit: int) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 1)] + "…"
 
 
 def _event_unified_msg_origin(event: Any) -> str:

@@ -252,7 +252,23 @@ class ConfigRuntimeTests(unittest.TestCase):
         self.assertEqual(raw["group_ttl_seconds"], 86400.0)
         self.assertEqual(raw["score_threshold_reply"], 0.78)
         self.assertEqual(raw["bot_aliases"], ["机器人"])
+        self.assertFalse(raw["log_decisions_enabled"])
+        self.assertFalse(raw["log_message_excerpt_enabled"])
         self.assertTrue(raw.saved)
+
+    def test_log_settings_are_opt_in(self) -> None:
+        default_config = PluginConfig.from_astrbot_config({})
+        enabled_config = PluginConfig.from_astrbot_config(
+            {
+                "log_decisions_enabled": True,
+                "log_message_excerpt_enabled": True,
+            },
+        )
+
+        self.assertFalse(default_config.log_decisions_enabled)
+        self.assertFalse(default_config.log_message_excerpt_enabled)
+        self.assertTrue(enabled_config.log_decisions_enabled)
+        self.assertTrue(enabled_config.log_message_excerpt_enabled)
 
     def test_save_trims_group_mode_keys(self) -> None:
         raw = FakeConfig({"group_modes": {}})

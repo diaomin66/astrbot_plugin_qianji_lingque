@@ -100,6 +100,18 @@
     "default": true,
     "hint": "启用后可用 /读空气 原因 查看最近一次判定。"
   },
+  "log_decisions_enabled": {
+    "description": "输出读空气判定日志",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭。启用后会在 AstrBot 日志中输出读空气判定、是否计划/实际调用 LLM、动作、分数和原因；普通跳过日志使用 DEBUG，关键 LLM 生命周期使用 INFO。"
+  },
+  "log_message_excerpt_enabled": {
+    "description": "日志包含消息摘要",
+    "type": "bool",
+    "default": false,
+    "hint": "默认只记录消息长度，不记录群聊原文。开启后会在判定日志中写入最多 80 字消息摘要，可能包含隐私内容，请谨慎使用。"
+  },
   "takeover_explicit_mentions": {
     "description": "接管明确点名",
     "type": "bool",

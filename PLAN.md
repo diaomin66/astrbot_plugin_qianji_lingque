@@ -39,6 +39,8 @@
 - `max_tracked_groups`: 最多保留群状态数。
 - `group_ttl_seconds`: 群状态无活动后的清理时间。
 - `takeover_explicit_mentions`: 是否接管 @/引用/wake 场景，避免默认 LLM 重复回答。
+- `log_decisions_enabled`: 是否在 AstrBot 日志中输出读空气判定、计划调用 LLM、实际调用 LLM 和发送收尾信息，默认关闭。
+- `log_message_excerpt_enabled`: 是否在日志中输出最多 80 字消息摘要，默认关闭，仅建议临时排障使用。
 
 ## Performance Strategy
 
@@ -46,6 +48,7 @@
 - 每群独立冷却，bot 刚回复后更克制。
 - 每群只保留短期环形上下文，且限制总群数和 TTL。
 - 复杂媒体、远程媒体和第三方 runner 场景放行 AstrBot 默认链路。
+- 日志开关默认关闭；开启后普通跳过判定使用 DEBUG，关键 LLM 生命周期使用 INFO，并默认隐藏群聊原文。
 
 ## Test Plan
 

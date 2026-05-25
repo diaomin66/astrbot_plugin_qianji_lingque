@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 SDK_PATH = Path(__file__).resolve().parents[1] / ".venv" / "Lib" / "site-packages"
 if SDK_PATH.exists() and str(SDK_PATH) not in sys.path:
@@ -343,6 +344,87 @@ class RuntimeLLMTests(unittest.TestCase):
         self.assertTrue(event.suppressed_default_llm)
         self.assertNotIn("enable_streaming", event.extra)
         self.assertEqual(context.prompts, [])
+
+    def test_decision_logging_is_off_by_default(self) -> None:
+        context = FakeContext([])
+        runtime = QianjiLingqueRuntime(context, active_config(bot_aliases=["机器人"]))
+        event = FakeGroupEvent("机器人，帮我看看这个怎么弄？")
+
+        with patch("qianji_lingque.runtime.logger.info") as info, patch(
+            "qianji_lingque.runtime.logger.debug",
+        ) as debug:
+            asyncio.run(_collect(runtime.handle_group_message(event)))
+
+        self.assertEqual(info.call_count, 0)
+        self.assertEqual(debug.call_count, 0)
+
+    def test_decision_logging_hides_message_excerpt_and_splits_plan_from_actual(self) -> None:
+        context = FakeContext([])
+        runtime = QianjiLingqueRuntime(
+            context,
+            active_config(log_decisions_enabled=True, bot_aliases=["机器人"]),
+        )
+        event = FakeGroupEvent("机器人，帮我看看这个私密 token=abc123 怎么弄？")
+
+        with patch("qianji_lingque.runtime.logger.info") as info:
+            asyncio.run(_collect(runtime.handle_group_message(event)))
+
+        rendered = _render_log_calls(info)
+        self.assertIn("计划调用LLM=是", rendered)
+        self.assertIn("实际调用LLM=否", rendered)
+        self.assertIn("已隐藏(长度=", rendered)
+        self.assertNotIn("abc123", rendered)
+
+    def test_non_llm_decision_logging_uses_debug_without_message_excerpt(self) -> None:
+        context = FakeContext([])
+        runtime = QianjiLingqueRuntime(
+            context,
+            active_config(log_decisions_enabled=True),
+        )
+        event = FakeGroupEvent("普通闲聊 token=abc123")
+
+        with patch("qianji_lingque.runtime.logger.info") as info, patch(
+            "qianji_lingque.runtime.logger.debug",
+        ) as debug:
+            asyncio.run(_collect(runtime.handle_group_message(event)))
+
+        rendered = _render_log_calls(debug)
+        self.assertEqual(info.call_count, 0)
+        self.assertIn("计划调用LLM=否", rendered)
+        self.assertIn("已隐藏(长度=", rendered)
+        self.assertNotIn("abc123", rendered)
+
+    def test_llm_request_logging_records_actual_call(self) -> None:
+        context = FakeContext([])
+        runtime = QianjiLingqueRuntime(
+            context,
+            active_config(log_decisions_enabled=True, bot_aliases=["机器人"]),
+        )
+        event = FakeGroupEvent("机器人，帮我看看这个怎么弄？")
+
+        with patch("qianji_lingque.runtime.logger.info") as info:
+            asyncio.run(_collect_with_request_hook(runtime, event))
+
+        rendered = _render_log_calls(info)
+        self.assertIn("计划调用LLM=是", rendered)
+        self.assertIn("实际调用LLM=是", rendered)
+
+    def test_message_excerpt_logging_is_explicit_opt_in(self) -> None:
+        context = FakeContext([])
+        runtime = QianjiLingqueRuntime(
+            context,
+            active_config(
+                log_decisions_enabled=True,
+                log_message_excerpt_enabled=True,
+                bot_aliases=["机器人"],
+            ),
+        )
+        event = FakeGroupEvent("机器人，帮我看看这个怎么弄？")
+
+        with patch("qianji_lingque.runtime.logger.info") as info:
+            asyncio.run(_collect(runtime.handle_group_message(event)))
+
+        self.assertIn("机器人，帮我看看这个怎么弄？", _render_log_calls(info))
 
     def test_llm_request_keeps_conversation_without_polluting_user_prompt(self) -> None:
         context = FakeContext([])
@@ -1258,11 +1340,19 @@ class RuntimeLLMTests(unittest.TestCase):
 
     def test_timed_out_active_pending_is_removed_after_retention_window(self) -> None:
         context = FakeContext([])
-        runtime = QianjiLingqueRuntime(context, active_config(bot_aliases=["机器人"], reply_timeout_seconds=1.0))
+        runtime = QianjiLingqueRuntime(
+            context,
+            active_config(
+                bot_aliases=["机器人"],
+                reply_timeout_seconds=1.0,
+                log_decisions_enabled=True,
+            ),
+        )
         event = FakeGroupEvent("机器人，帮我看看这个怎么弄？")
         event.extra["enable_streaming"] = True
 
-        asyncio.run(_collect_with_request_hook(runtime, event))
+        with patch("qianji_lingque.runtime.logger.info"):
+            asyncio.run(_collect_with_request_hook(runtime, event))
         token = next(iter(runtime._pending_replies))
         original = runtime._pending_replies[token]
         runtime._pending_replies[token] = type(original)(
@@ -1278,12 +1368,14 @@ class RuntimeLLMTests(unittest.TestCase):
             previous_streaming=original.previous_streaming,
         )
 
-        runtime._expire_pending_token(token)
+        with patch("qianji_lingque.runtime.logger.info") as info:
+            runtime._expire_pending_token(token)
 
         self.assertNotIn(token, runtime._pending_replies)
         self.assertNotIn(token, runtime._pending_events)
         self.assertIs(event.extra["enable_streaming"], True)
         self.assertNotIn("qianji_lingque_pending", event.extra)
+        self.assertIn("LLM状态超时清理", _render_log_calls(info))
 
     def test_responded_pending_expires_with_cooldown_when_after_hook_is_skipped(self) -> None:
         context = FakeContext([])
@@ -2303,6 +2395,21 @@ def _record_request(runtime: QianjiLingqueRuntime, event: FakeGroupEvent) -> Non
     request = event.llm_requests[-1]
     event.set_extra("provider_request", request)
     runtime.record_llm_request(event, request)
+
+
+def _render_log_calls(mock_logger) -> str:
+    rendered: list[str] = []
+    for call in mock_logger.call_args_list:
+        if not call.args:
+            continue
+        message = str(call.args[0])
+        if len(call.args) > 1:
+            try:
+                message = message % call.args[1:]
+            except TypeError:
+                message = " ".join(str(item) for item in call.args)
+        rendered.append(message)
+    return "\n".join(rendered)
 
 
 if __name__ == "__main__":

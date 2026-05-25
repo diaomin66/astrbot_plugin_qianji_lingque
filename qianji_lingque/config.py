@@ -38,6 +38,8 @@ class PluginConfig:
     score_threshold_reply: float = 0.78
     score_threshold_ignore: float = 0.35
     debug_explain_enabled: bool = True
+    log_decisions_enabled: bool = False
+    log_message_excerpt_enabled: bool = False
     takeover_explicit_mentions: bool = True
     bot_aliases: list[str] = field(default_factory=list)
     source: Any = field(default=None, repr=False, compare=False)
@@ -71,6 +73,8 @@ class PluginConfig:
             score_threshold_reply=_clamp_float(data.get("score_threshold_reply"), 0.78, 0.0, 1.0),
             score_threshold_ignore=_clamp_float(data.get("score_threshold_ignore"), 0.35, 0.0, 1.0),
             debug_explain_enabled=_bool(data.get("debug_explain_enabled"), True),
+            log_decisions_enabled=_bool(data.get("log_decisions_enabled"), False),
+            log_message_excerpt_enabled=_bool(data.get("log_message_excerpt_enabled"), False),
             takeover_explicit_mentions=_bool(data.get("takeover_explicit_mentions"), True),
             bot_aliases=_string_list(data.get("bot_aliases"), []),
             source=config,
@@ -102,6 +106,8 @@ class PluginConfig:
         self.source["score_threshold_reply"] = self.score_threshold_reply
         self.source["score_threshold_ignore"] = self.score_threshold_ignore
         self.source["debug_explain_enabled"] = self.debug_explain_enabled
+        self.source["log_decisions_enabled"] = self.log_decisions_enabled
+        self.source["log_message_excerpt_enabled"] = self.log_message_excerpt_enabled
         self.source["takeover_explicit_mentions"] = self.takeover_explicit_mentions
         self.source["bot_aliases"] = list(self.bot_aliases)
         save_config = getattr(self.source, "save_config", None)
