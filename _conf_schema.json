@@ -6,16 +6,16 @@
     "hint": "关闭后插件不会监听群聊读空气。"
   },
   "enabled_groups": {
-    "description": "启用的群聊 ID",
+    "description": "启用的群聊实例 key",
     "type": "list",
     "default": [],
-    "hint": "留空表示所有群聊启用；填写后仅这些群聊生效。"
+    "hint": "默认留空表示不自动监听任何群；推荐用 /读空气 开启 写入当前平台实例的 key，或填 * 明确启用所有群。裸群号只适用于没有平台实例信息的旧事件。"
   },
   "disabled_groups": {
     "description": "禁用的群聊 ID",
     "type": "list",
     "default": [],
-    "hint": "用于在 enabled_groups 留空时关闭少数群；也会覆盖白名单。"
+    "hint": "显式禁用少数群，会覆盖 enabled_groups。兼容 群号、平台实例ID:群号 和 unified_msg_origin。"
   },
   "mode": {
     "description": "默认回复积极度",
@@ -29,7 +29,7 @@
     "type": "list",
     "default": [],
     "invisible": true,
-    "hint": "由 /读空气 模式 写入。单实例通常是 群号=quiet|normal|active；多 aiocqhttp 实例会写入 平台实例ID:群号=quiet|normal|active。"
+    "hint": "由 /读空气 模式 写入。优先写入 unified_msg_origin=quiet|normal|active；旧的 群号 或 平台实例ID:群号 仍会被读取。"
   },
   "max_context_messages": {
     "description": "每个群保留的最近消息数",
@@ -66,6 +66,20 @@
     "slider": {"min": 1, "max": 60, "step": 1},
     "hint": "用于清理长时间未收到 LLM 响应的 pending 状态。"
   },
+  "max_tracked_groups": {
+    "description": "最多保留群状态数",
+    "type": "int",
+    "default": 200,
+    "slider": {"min": 1, "max": 2000, "step": 1},
+    "hint": "限制长期运行时保留的群聊状态数量；正在生成回复的群会优先保留，但不会突破这个上限。"
+  },
+  "group_ttl_seconds": {
+    "description": "群状态保留秒数",
+    "type": "float",
+    "default": 86400.0,
+    "slider": {"min": 60, "max": 604800, "step": 60},
+    "hint": "群聊长期没有新消息时自动清理短期上下文。默认 1 天。"
+  },
   "score_threshold_reply": {
     "description": "直接回复分数阈值",
     "type": "float",
@@ -90,12 +104,12 @@
     "description": "接管明确点名",
     "type": "bool",
     "default": true,
-    "hint": "开启后消息链 @ 或引用 bot 的回复会阻止默认 LLM 链路，避免重复回答。"
+    "hint": "开启后消息链 @、引用 bot 或 AstrBot wake 前缀会阻止默认 LLM 链路，避免重复回答。"
   },
   "bot_aliases": {
     "description": "bot 昵称",
     "type": "list",
-    "default": ["机器人", "小助手"],
-    "hint": "群聊中出现这些称呼会提高回复概率。"
+    "default": [],
+    "hint": "默认不启用泛昵称触发。建议只填群内独有昵称，避免把普通讨论误判为点名。"
   }
 }

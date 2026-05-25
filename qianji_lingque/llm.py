@@ -314,7 +314,10 @@ async def _component_file_or_url(component: Any, media_kind: str) -> str:
     for attr in ("url", "file", "path"):
         value = getattr(component, attr, None)
         if isinstance(value, str) and value.strip():
-            media_ref = _safe_media_ref(value.strip(), media_kind)
+            raw_value = value.strip()
+            if _is_remote_media_ref(raw_value):
+                return ""
+            media_ref = _safe_media_ref(raw_value, media_kind)
             if media_ref:
                 return media_ref
     converter = getattr(component, "convert_to_file_path", None)
@@ -328,11 +331,16 @@ async def _component_file_or_url(component: Any, media_kind: str) -> str:
     return ""
 
 
+def _is_remote_media_ref(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
 def _safe_media_ref(value: str, media_kind: str) -> str:
     if os.path.isabs(value) and _is_valid_local_media(value, media_kind):
         return value
     parsed = urlparse(value)
-    if parsed.scheme in {"http", "https"} and parsed.netloc:
+    if _is_remote_media_ref(value):
         return ""
     if parsed.scheme == "file" and parsed.path and not parsed.netloc:
         local_path = _file_uri_to_path(parsed.path)

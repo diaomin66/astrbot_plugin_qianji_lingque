@@ -17,9 +17,19 @@ class FakeConfig(dict):
 
 
 class FakeEvent:
-    def __init__(self, group_id: str = "group-1", text: str = "你好") -> None:
+    def __init__(
+        self,
+        group_id: str = "group-1",
+        text: str = "你好",
+        *,
+        platform_id: str = "",
+        platform_name: str = "",
+    ) -> None:
         self.group_id = group_id
         self.message_str = text
+        self.platform_id = platform_id
+        self.platform_name = platform_name
+        self.unified_msg_origin = f"{platform_id}:GroupMessage:{group_id}" if platform_id else ""
 
     def get_group_id(self) -> str:
         return self.group_id
@@ -39,6 +49,12 @@ class FakeEvent:
     def get_messages(self) -> list[object]:
         return []
 
+    def get_platform_id(self) -> str:
+        return self.platform_id
+
+    def get_platform_name(self) -> str:
+        return self.platform_name
+
 
 class ConfigRuntimeTests(unittest.TestCase):
     def test_parse_mode_rejects_unknown_input(self) -> None:
@@ -47,18 +63,23 @@ class ConfigRuntimeTests(unittest.TestCase):
         self.assertEqual(parse_mode("积极"), "active")
 
     def test_disable_group_uses_blacklist_when_all_groups_enabled(self) -> None:
-        raw = FakeConfig({"enabled_groups": [], "disabled_groups": []})
+        raw = FakeConfig({"enabled_groups": ["*"], "disabled_groups": []})
         config = PluginConfig.from_astrbot_config(raw)
         runtime = QianjiLingqueRuntime(context=None, config=config)
 
         runtime.disable_group(FakeEvent("group-1"))
 
-        self.assertEqual(config.enabled_groups, [])
+        self.assertEqual(config.enabled_groups, ["*"])
         self.assertEqual(config.disabled_groups, ["group-1"])
         self.assertFalse(config.is_group_enabled("group-1"))
         self.assertTrue(config.is_group_enabled("group-2"))
         self.assertEqual(raw["disabled_groups"], ["group-1"])
         self.assertTrue(raw.saved)
+
+    def test_empty_enabled_groups_means_no_passive_listening_by_default(self) -> None:
+        config = PluginConfig.from_astrbot_config({"enabled_groups": [], "disabled_groups": []})
+
+        self.assertFalse(config.is_group_enabled("group-1"))
 
     def test_disable_group_does_not_empty_whitelist_into_global_enable(self) -> None:
         raw = FakeConfig({"enabled_groups": ["group-1"], "disabled_groups": []})
@@ -79,8 +100,98 @@ class ConfigRuntimeTests(unittest.TestCase):
 
         runtime.enable_group(FakeEvent("group-1"))
 
+        self.assertEqual(config.enabled_groups, ["group-1"])
         self.assertEqual(config.disabled_groups, [])
         self.assertTrue(config.is_group_enabled("group-1"))
+
+    def test_enable_group_removes_legacy_platform_blacklist_entry(self) -> None:
+        raw = FakeConfig(
+            {
+                "enabled_groups": ["*"],
+                "disabled_groups": ["onebot-a:group-1"],
+            },
+        )
+        config = PluginConfig.from_astrbot_config(raw)
+        runtime = QianjiLingqueRuntime(context=None, config=config)
+
+        runtime.enable_group(
+            FakeEvent(
+                "group-1",
+                platform_id="onebot-a",
+                platform_name="aiocqhttp",
+            ),
+        )
+
+        self.assertEqual(config.disabled_groups, [])
+
+    def test_enable_scoped_group_keeps_bare_disabled_safety_entry(self) -> None:
+        raw = FakeConfig(
+            {
+                "enabled_groups": ["*"],
+                "disabled_groups": ["group-1", "onebot-a:group-1"],
+            },
+        )
+        config = PluginConfig.from_astrbot_config(raw)
+        runtime = QianjiLingqueRuntime(context=None, config=config)
+
+        runtime.enable_group(
+            FakeEvent(
+                "group-1",
+                platform_id="onebot-a",
+                platform_name="aiocqhttp",
+            ),
+        )
+
+        self.assertEqual(config.disabled_groups, ["group-1"])
+
+    def test_enable_scoped_group_appends_scoped_key_when_bare_enabled_exists(self) -> None:
+        raw = FakeConfig({"enabled_groups": ["group-1"], "disabled_groups": []})
+        config = PluginConfig.from_astrbot_config(raw)
+        runtime = QianjiLingqueRuntime(context=None, config=config)
+        event = FakeEvent(
+            "group-1",
+            platform_id="onebot-a",
+            platform_name="aiocqhttp",
+        )
+
+        message = runtime.enable_group(event)
+
+        self.assertIn("已开启当前群", message)
+        self.assertEqual(config.enabled_groups, ["group-1", "onebot-a:GroupMessage:group-1"])
+        self.assertIn("群开关：开启", runtime.render_status(event))
+
+    def test_enable_scoped_group_warns_when_bare_disabled_still_blocks(self) -> None:
+        raw = FakeConfig({"enabled_groups": ["*"], "disabled_groups": ["group-1"]})
+        config = PluginConfig.from_astrbot_config(raw)
+        runtime = QianjiLingqueRuntime(context=None, config=config)
+        event = FakeEvent(
+            "group-1",
+            platform_id="onebot-a",
+            platform_name="aiocqhttp",
+        )
+
+        message = runtime.enable_group(event)
+
+        self.assertIn("安全阀仍生效", message)
+        self.assertEqual(config.disabled_groups, ["group-1"])
+        self.assertIn("群开关：关闭", runtime.render_status(event))
+
+    def test_unsupported_platform_command_does_not_mutate_config(self) -> None:
+        raw = FakeConfig({"enabled_groups": [], "disabled_groups": []})
+        config = PluginConfig.from_astrbot_config(raw)
+        runtime = QianjiLingqueRuntime(context=None, config=config)
+
+        message = runtime.enable_group(
+            FakeEvent(
+                "group-1",
+                platform_id="telegram-a",
+                platform_name="telegram",
+            ),
+        )
+
+        self.assertIn("只支持 aiocqhttp", message)
+        self.assertEqual(config.enabled_groups, [])
+        self.assertFalse(raw.saved)
 
     def test_enable_group_reports_global_disabled_state(self) -> None:
         raw = FakeConfig({"enabled": False, "enabled_groups": [], "disabled_groups": ["group-1"]})
@@ -137,6 +248,8 @@ class ConfigRuntimeTests(unittest.TestCase):
         config.save()
 
         self.assertEqual(raw["max_context_messages"], 24)
+        self.assertEqual(raw["max_tracked_groups"], 200)
+        self.assertEqual(raw["group_ttl_seconds"], 86400.0)
         self.assertEqual(raw["score_threshold_reply"], 0.78)
         self.assertEqual(raw["bot_aliases"], ["机器人"])
         self.assertTrue(raw.saved)
@@ -232,13 +345,37 @@ class ConfigRuntimeTests(unittest.TestCase):
         self.assertEqual(config.bot_aliases, ["机器人"])
 
     def test_status_uses_distinct_group_switch_label(self) -> None:
-        config = PluginConfig.from_astrbot_config({"mode": "normal"})
+        config = PluginConfig.from_astrbot_config({"mode": "normal", "enabled_groups": ["group-1"]})
         runtime = QianjiLingqueRuntime(context=None, config=config)
 
         message = runtime.render_status(FakeEvent("group-1"))
 
         self.assertIn("当前群：group-1", message)
         self.assertIn("群开关：开启", message)
+
+    def test_status_requires_group_context(self) -> None:
+        config = PluginConfig.from_astrbot_config({"enabled_groups": ["*"]})
+        runtime = QianjiLingqueRuntime(context=None, config=config)
+
+        message = runtime.render_status(FakeEvent(""))
+
+        self.assertIn("请在群聊中使用", message)
+        self.assertNotIn("群开关：开启", message)
+
+    def test_status_reports_unsupported_platform_without_enabled_state(self) -> None:
+        config = PluginConfig.from_astrbot_config({"enabled_groups": ["*"]})
+        runtime = QianjiLingqueRuntime(context=None, config=config)
+
+        message = runtime.render_status(
+            FakeEvent(
+                "group-1",
+                platform_id="telegram-a",
+                platform_name="telegram",
+            ),
+        )
+
+        self.assertIn("只支持 aiocqhttp", message)
+        self.assertNotIn("群开关：开启", message)
 
     def test_ascii_alias_requires_word_boundary(self) -> None:
         event = FakeEvent("group-1", text="robotics is fun")
@@ -254,7 +391,7 @@ class ConfigRuntimeTests(unittest.TestCase):
         direct = snapshot_from_event(FakeEvent("group-1", text="机器人，帮我看看"), ["机器人"])
 
         self.assertFalse(generic.mentions_bot)
-        self.assertTrue(common_wake.mentions_bot)
+        self.assertFalse(common_wake.mentions_bot)
         self.assertTrue(compact_wake.mentions_bot)
         self.assertTrue(direct.mentions_bot)
 

@@ -33,7 +33,7 @@ def snapshot(
 
 class DecisionTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.config = PluginConfig(bot_aliases=["千机"])
+        self.config = PluginConfig(enabled_groups=["group-1"], bot_aliases=["千机"])
         self.store = ContextStore(max_messages=24)
         self.engine = DecisionEngine()
 
@@ -94,7 +94,7 @@ class DecisionTests(unittest.TestCase):
         self.assertIn("未过最短回复间隔", decision.reason)
 
     def test_disabled_group_ignores(self) -> None:
-        config = PluginConfig(disabled_groups=["group-1"])
+        config = PluginConfig(enabled_groups=["group-1"], disabled_groups=["group-1"])
         state = self.store.get_group("group-1")
 
         decision = self.engine.decide(snapshot("千机？", mentions_bot=True), state, config)

@@ -19,6 +19,7 @@ class AstrBotEntrypointSmokeTests(unittest.TestCase):
             """
             import main
             import asyncio
+            import sys
             from astrbot.api.provider import ProviderRequest
             from astrbot.core.star.filter.event_message_type import EventMessageTypeFilter
             from astrbot.core.star.filter.permission import PermissionTypeFilter
@@ -51,6 +52,7 @@ class AstrBotEntrypointSmokeTests(unittest.TestCase):
             event_handler = next(item for item in handlers if item.handler_name == "on_group_message")
             assert any(isinstance(item, EventMessageTypeFilter) for item in event_handler.event_filters)
             assert any(isinstance(item, PlatformAdapterTypeFilter) for item in event_handler.event_filters)
+            assert event_handler.extras_configs["priority"] == -sys.maxsize
 
             for handler_name in ("lingque_enable", "lingque_disable", "lingque_mode"):
                 handler = next(item for item in handlers if item.handler_name == handler_name)
@@ -79,7 +81,7 @@ class AstrBotEntrypointSmokeTests(unittest.TestCase):
                 conversation_manager = ConvManager()
 
             class Event:
-                unified_msg_origin = "aiocqhttp:group:group-1"
+                unified_msg_origin = "aiocqhttp:GroupMessage:group-1"
 
                 def __init__(self):
                     self.stopped = False
@@ -113,7 +115,7 @@ class AstrBotEntrypointSmokeTests(unittest.TestCase):
                 return [item async for item in gen]
 
             event = Event()
-            runtime = QianjiLingqueRuntime(Context(), PluginConfig(bot_aliases=["机器人"]))
+            runtime = QianjiLingqueRuntime(Context(), PluginConfig(enabled_groups=["*"], bot_aliases=["机器人"]))
             results = asyncio.run(collect(runtime.handle_group_message(event)))
             assert len(results) == 1
             assert isinstance(results[0], ProviderRequest)

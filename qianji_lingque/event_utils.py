@@ -166,7 +166,7 @@ def _is_wake_boundary(char: str, *, before: bool) -> bool:
 
 
 def _is_common_chinese_wake_tail(char: str) -> bool:
-    return char in {"你", "帮", "看", "在", "能", "可", "来", "请", "给", "怎", "为", "会", "要", "吗"}
+    return char in {"你", "帮", "看", "来", "请", "给"}
 
 
 def _sender_attr_for(attr_name: str) -> str | None:

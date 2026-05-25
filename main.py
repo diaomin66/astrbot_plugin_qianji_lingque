@@ -1,22 +1,17 @@
 from __future__ import annotations
 
+import sys
 from typing import Any, AsyncIterator
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 
 from qianji_lingque.config import PluginConfig
 from qianji_lingque.runtime import QianjiLingqueRuntime
 
 
-@register(
-    "astrbot_plugin_qianji_lingque",
-    "雪碧bir",
-    "在群聊中通过上下文判断是否应当回复，让 AstrBot 更会读空气。",
-    "v0.1.0",
-)
 class QianjiLingquePlugin(Star):
     """千机聆阙插件入口。"""
 
@@ -29,7 +24,7 @@ class QianjiLingquePlugin(Star):
         self.runtime.terminate()
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=-sys.maxsize)
     async def on_group_message(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         async for result in self.runtime.handle_group_message(event):
             yield result
@@ -51,7 +46,7 @@ class QianjiLingquePlugin(Star):
         self.runtime.record_llm_request(event, req)
 
     @filter.command_group("读空气", alias={"空气"})
-    def read_air(self) -> None:
+    async def read_air(self) -> None:
         pass
 
     @read_air.command("状态")

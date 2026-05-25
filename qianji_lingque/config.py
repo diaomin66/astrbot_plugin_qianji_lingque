@@ -33,11 +33,13 @@ class PluginConfig:
     min_reply_interval_seconds: float = 18.0
     bot_cooldown_after_reply_seconds: float = 35.0
     reply_timeout_seconds: float = 12.0
+    max_tracked_groups: int = 200
+    group_ttl_seconds: float = 86400.0
     score_threshold_reply: float = 0.78
     score_threshold_ignore: float = 0.35
     debug_explain_enabled: bool = True
     takeover_explicit_mentions: bool = True
-    bot_aliases: list[str] = field(default_factory=lambda: ["机器人", "小助手"])
+    bot_aliases: list[str] = field(default_factory=list)
     source: Any = field(default=None, repr=False, compare=False)
 
     @classmethod
@@ -64,11 +66,13 @@ class PluginConfig:
                 1200.0,
             ),
             reply_timeout_seconds=_clamp_float(data.get("reply_timeout_seconds"), 12.0, 1.0, 60.0),
+            max_tracked_groups=_clamp_int(data.get("max_tracked_groups"), 200, 1, 2000),
+            group_ttl_seconds=_clamp_float(data.get("group_ttl_seconds"), 86400.0, 60.0, 604800.0),
             score_threshold_reply=_clamp_float(data.get("score_threshold_reply"), 0.78, 0.0, 1.0),
             score_threshold_ignore=_clamp_float(data.get("score_threshold_ignore"), 0.35, 0.0, 1.0),
             debug_explain_enabled=_bool(data.get("debug_explain_enabled"), True),
             takeover_explicit_mentions=_bool(data.get("takeover_explicit_mentions"), True),
-            bot_aliases=_string_list(data.get("bot_aliases"), ["机器人", "小助手"]),
+            bot_aliases=_string_list(data.get("bot_aliases"), []),
             source=config,
         ).normalized()
 
@@ -93,6 +97,8 @@ class PluginConfig:
         self.source["min_reply_interval_seconds"] = self.min_reply_interval_seconds
         self.source["bot_cooldown_after_reply_seconds"] = self.bot_cooldown_after_reply_seconds
         self.source["reply_timeout_seconds"] = self.reply_timeout_seconds
+        self.source["max_tracked_groups"] = self.max_tracked_groups
+        self.source["group_ttl_seconds"] = self.group_ttl_seconds
         self.source["score_threshold_reply"] = self.score_threshold_reply
         self.source["score_threshold_ignore"] = self.score_threshold_ignore
         self.source["debug_explain_enabled"] = self.debug_explain_enabled
@@ -110,9 +116,14 @@ class PluginConfig:
             return False
         if group_id in self.disabled_groups:
             return False
-        if not self.enabled_groups:
+        if _all_groups_enabled(self.enabled_groups):
             return True
+        if not self.enabled_groups:
+            return False
         return group_id in self.enabled_groups
+
+    def enables_all_groups(self) -> bool:
+        return _all_groups_enabled(self.enabled_groups)
 
 
 def normalize_mode(value: str) -> str:
@@ -217,3 +228,7 @@ def _mode_entries(value: dict[str, str]) -> list[str]:
         if group_id and mode:
             result.append(f"{group_id}={mode}")
     return result
+
+
+def _all_groups_enabled(values: list[str]) -> bool:
+    return any(str(value).strip().lower() in {"*", "all", "全部"} for value in values)

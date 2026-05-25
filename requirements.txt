@@ -1,0 +1,2 @@
+# No third-party runtime dependencies.
+# AstrBot provides the plugin API inside the host environment.

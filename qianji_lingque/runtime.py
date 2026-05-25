@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -12,10 +13,46 @@ from .config import PluginConfig, mode_label, parse_mode
 from .event_utils import group_id_from_event, snapshot_from_event
 from .llm import LLMClient, extract_chain_text
 
+try:
+    from astrbot.core.astr_main_agent_resources import (
+        SANDBOX_MODE_PROMPT,
+        TOOL_CALL_PROMPT,
+        TOOL_CALL_PROMPT_SKILLS_LIKE_MODE,
+    )
+except Exception:
+    SANDBOX_MODE_PROMPT = ""
+    TOOL_CALL_PROMPT = ""
+    TOOL_CALL_PROMPT_SKILLS_LIKE_MODE = ""
+
+try:
+    from astrbot.core.utils.astrbot_path import get_astrbot_workspaces_path
+except Exception:
+    get_astrbot_workspaces_path = None
+
 
 PENDING_EXTRA_KEY = "qianji_lingque_pending"
 EXTERNAL_LLM_EXTRA_KEY = "qianji_lingque_external_llm_recorded"
+EXTERNAL_LLM_REQUEST_EXTRA_KEY = "qianji_lingque_external_llm_requested"
 SUPPORTED_PLATFORM_IDS = {"aiocqhttp"}
+SDK_TOOL_PROMPTS = tuple(
+    prompt.strip()
+    for prompt in (SANDBOX_MODE_PROMPT, TOOL_CALL_PROMPT, TOOL_CALL_PROMPT_SKILLS_LIKE_MODE)
+    if isinstance(prompt, str) and prompt.strip()
+)
+KNOWN_TOOL_PROMPTS = {
+    "When using tools: never return an empty response; follow schemas.",
+    "When using tools: never return an empty response; briefly explain the purpose before calling a tool; follow the tool schema exactly and do not invent parameters; after execution, briefly summarize the result for the user; keep the conversation style consistent.",
+    "You MUST NOT return an empty response, especially after invoking a tool.",
+    "You MUST NOT return an empty response, especially after invoking a tool. Before calling any tool, provide a brief explanatory message to the user stating the purpose of the tool call. Tool schemas are provided in two stages: first only name and description; if you decide to use a tool, the full parameter schema will be provided in a follow-up step. Do not guess arguments before you see the schema. After the tool call is completed, you must briefly summarize the results returned by the tool for the user. Keep the role-play and style consistent throughout the conversation.",
+    "You have access to the host local environment and can execute shell commands.",
+    "You have access to a sandboxed environment and can execute shell commands and Python code securely.",
+    "User has not enabled the Computer Use feature.",
+}
+ASTRBOT_WORKSPACES_PATH = (
+    os.path.realpath(get_astrbot_workspaces_path())
+    if callable(get_astrbot_workspaces_path)
+    else ""
+)
 
 
 @dataclass(frozen=True)
@@ -37,7 +74,11 @@ class QianjiLingqueRuntime:
     def __init__(self, context: Any, config: PluginConfig) -> None:
         self.context = context
         self.config = config
-        self.context_store = ContextStore(config.max_context_messages)
+        self.context_store = ContextStore(
+            config.max_context_messages,
+            max_groups=config.max_tracked_groups,
+            group_ttl_seconds=config.group_ttl_seconds,
+        )
         self.decision_engine = DecisionEngine()
         self.llm_client = LLMClient(context)
         self._pending_replies: dict[str, PendingReply] = {}
@@ -50,8 +91,22 @@ class QianjiLingqueRuntime:
             if False:
                 yield None
             return
+        self._sync_protected_context_groups()
+        self.context_store.configure(
+            max_messages=self.config.max_context_messages,
+            max_groups=self.config.max_tracked_groups,
+            group_ttl_seconds=self.config.group_ttl_seconds,
+        )
+        if _event_has_send_operation(event) and not _get_pending_payload(event):
+            if False:
+                yield None
+            return
         snapshot = snapshot_from_event(event, self.config.bot_aliases)
         if _looks_like_chat_command(snapshot.text):
+            if False:
+                yield None
+            return
+        if _get_raw_extra(event, EXTERNAL_LLM_REQUEST_EXTRA_KEY):
             if False:
                 yield None
             return
@@ -106,12 +161,10 @@ class QianjiLingqueRuntime:
             if _should_record_context(decision):
                 state.append_user_message(decision_snapshot)
             suppress_default = take_over_event or bool(getattr(event, "is_at_or_wake_command", False))
-            if wants_bot or suppress_default:
-                if suppress_default:
-                    _suppress_default_llm(event)
+            if suppress_default:
+                _suppress_default_llm(event)
                 yield event.plain_result("上一条还在生成，我先不叠加请求。")
-                if take_over_event:
-                    event.stop_event()
+                event.stop_event()
             if False:
                 yield None
             return
@@ -131,10 +184,12 @@ class QianjiLingqueRuntime:
             previous_streaming=previous_streaming,
             had_send_before=had_send_before,
         )
+        self._sync_protected_context_groups()
         self._schedule_pending_expiry(token)
         reply_request = await self.llm_client.build_reply_request(event, snapshot, state, final_reason)
         if reply_request is None:
             self._pending_replies.pop(token, None)
+            self._sync_protected_context_groups()
             self._cancel_timers_for_token(token)
             _clear_qianji_extra(event)
             detail = self.llm_client.last_error or "无法取得 AstrBot 会话。"
@@ -176,12 +231,11 @@ class QianjiLingqueRuntime:
             previous_streaming=previous_streaming,
             had_send_before=had_send_before,
         )
+        self._sync_protected_context_groups()
         self._pending_events[token] = event
         state.append_user_message(decision_snapshot)
         self._schedule_pending_expiry(token, replace=True)
-        suppress_default = take_over_event or bool(getattr(event, "is_at_or_wake_command", False))
-        if suppress_default:
-            _suppress_default_llm(event)
+        _suppress_default_llm(event)
         state.last_decision = f"reply ({decision.confidence:.2f})：{final_reason}"
         try:
             yield reply_request
@@ -190,6 +244,7 @@ class QianjiLingqueRuntime:
             pending_after_agent = self._pending_replies.get(token)
             if pending_after_agent is not None and pending_after_agent.status == "starting":
                 self._pending_replies.pop(token, None)
+                self._sync_protected_context_groups()
                 self._cancel_timers_for_token(token)
                 self._cleanup_pending_event(token, pending_after_agent)
                 _clear_qianji_extra(event)
@@ -206,7 +261,8 @@ class QianjiLingqueRuntime:
         group_id = str(payload.get("group_id", "") or "")
         token = str(payload.get("token", "") or "")
         if not group_id or not token:
-            self.record_external_llm_request(event)
+            if self._should_track_external_event(event):
+                self.record_external_llm_request(event)
             return
         request_id = _payload_int(payload, "request_id")
         if request_id and id(request) != request_id:
@@ -219,6 +275,7 @@ class QianjiLingqueRuntime:
             pending.group_id != group_id or (pending.request_id not in {0, request_id})
         ):
             return
+        _disable_provider_request_tools(request)
         self._pending_replies[token] = PendingReply(
             group_id=group_id,
             token=token,
@@ -231,13 +288,15 @@ class QianjiLingqueRuntime:
             previous_streaming=pending.previous_streaming if pending else None,
             had_send_before=pending.had_send_before if pending else bool(payload.get("had_send_before", False)),
         )
+        self._sync_protected_context_groups()
 
     def record_llm_response(self, event: Any, response: Any) -> None:
         payload = _get_pending_payload(event)
         group_id = str(payload.get("group_id", "") or "")
         token = str(payload.get("token", "") or "")
         if not group_id or not token:
-            self.record_external_llm_response(event, response)
+            if self._should_track_external_event(event):
+                self.record_external_llm_response(event, response)
             return
         current_request_id = _provider_request_id(event)
         pending = self._pending_replies.get(token)
@@ -306,6 +365,9 @@ class QianjiLingqueRuntime:
         group_id = str(payload.get("group_id", "") or "")
         token = str(payload.get("token", "") or "")
         if not group_id or not token:
+            if not self._should_track_external_event(event):
+                _delete_extra(event, EXTERNAL_LLM_EXTRA_KEY)
+                return
             if _should_ignore_external_event(event):
                 _delete_extra(event, EXTERNAL_LLM_EXTRA_KEY)
                 return
@@ -321,10 +383,16 @@ class QianjiLingqueRuntime:
         self._pending_events.pop(token, None)
         _clear_qianji_extra(event)
         if pending is None or pending.group_id != group_id:
+            self._sync_protected_context_groups()
             return
         if pending.status not in {"active", "responded", "empty_response", "error_response", "timed_out"}:
+            self._sync_protected_context_groups()
             return
 
+        state = self.context_store.peek_group(group_id)
+        if state is not None:
+            state.touch()
+        self._sync_protected_context_groups()
         state = self.context_store.peek_group(group_id)
         if state is None:
             return
@@ -375,8 +443,10 @@ class QianjiLingqueRuntime:
         state.last_decision = f"reply ({pending.confidence:.2f})：{pending.reason}"
 
     def _should_take_over_event(self, event: Any, snapshot: Any) -> bool:
-        del event
-        return bool(self.config.takeover_explicit_mentions and snapshot.is_explicit_to_bot)
+        return bool(
+            self.config.takeover_explicit_mentions
+            and (snapshot.is_explicit_to_bot or getattr(event, "is_at_or_wake_command", False))
+        )
 
     def _blocking_pending(
         self,
@@ -396,6 +466,7 @@ class QianjiLingqueRuntime:
             for token, pending in list(active):
                 if pending.status == "starting" and not pending.is_direct:
                     self._pending_replies.pop(token, None)
+                    self._sync_protected_context_groups()
                     self._cancel_timers_for_token(token)
                     self._cleanup_pending_event(token, pending)
                     active.remove((token, pending))
@@ -412,6 +483,7 @@ class QianjiLingqueRuntime:
                 expired_tokens.append(token)
         for token in expired_tokens:
             pending = self._pending_replies.pop(token, None)
+            self._sync_protected_context_groups()
             if pending is not None:
                 self._cancel_timers_for_token(token)
                 self._cleanup_pending_event(token, pending)
@@ -506,6 +578,7 @@ class QianjiLingqueRuntime:
             self._finalize_unconfirmed_response(token, pending)
             return
         self._pending_replies.pop(token, None)
+        self._sync_protected_context_groups()
         self._cancel_timers_for_token(token)
         self._cleanup_pending_event(token, pending)
         if state is not None:
@@ -515,6 +588,10 @@ class QianjiLingqueRuntime:
         self._pending_replies.pop(token, None)
         self._cancel_timers_for_token(token)
         self._cleanup_pending_event(token, pending)
+        state = self.context_store.peek_group(pending.group_id)
+        if state is not None:
+            state.touch()
+        self._sync_protected_context_groups()
         state = self.context_store.peek_group(pending.group_id)
         if state is None:
             return
@@ -542,6 +619,8 @@ class QianjiLingqueRuntime:
         _disable_agent_tools(request, run_context)
 
     def record_external_send(self, event: Any) -> None:
+        if not self._should_track_external_event(event):
+            return
         if not _event_has_send_operation(event):
             return
         if _should_ignore_external_event(event):
@@ -556,14 +635,19 @@ class QianjiLingqueRuntime:
         state.mark_bot_attempt(time.time())
 
     def record_external_llm_request(self, event: Any) -> None:
+        if not self._should_track_external_event(event):
+            return
         if _should_ignore_external_event(event):
             return
         group_id = _state_group_id(event, _get_group_id(event))
         state = self.context_store.peek_group(group_id)
+        _set_extra(event, EXTERNAL_LLM_REQUEST_EXTRA_KEY, True)
         if state is not None:
             state.mark_bot_attempt(time.time())
 
     def record_external_llm_response(self, event: Any, response: Any) -> None:
+        if not self._should_track_external_event(event):
+            return
         if _should_ignore_external_event(event):
             return
         group_id = _state_group_id(event, _get_group_id(event))
@@ -588,11 +672,15 @@ class QianjiLingqueRuntime:
         for token, pending in list(self._pending_replies.items()):
             self._cleanup_pending_event(token, pending)
         self._pending_replies.clear()
+        self._sync_protected_context_groups()
         self._pending_events.clear()
 
     def render_status(self, event: Any) -> str:
         group_id = _get_group_id(event)
-        enabled = self.config.is_group_enabled(group_id)
+        if not group_id:
+            return "千机聆阙：请在群聊中使用这个指令。"
+        if not _is_supported_platform(event):
+            return "千机聆阙：当前只支持 aiocqhttp 群聊；本平台不会被被动监听。"
         state_group_id = _state_group_id(event, group_id)
         enabled = _is_group_enabled(self.config, group_id, state_group_id)
         effective_mode = _effective_mode(self.config, group_id, state_group_id)
@@ -605,21 +693,35 @@ class QianjiLingqueRuntime:
         )
 
     def enable_group(self, event: Any) -> str:
+        if not _is_supported_platform(event):
+            return "千机聆阙：当前只支持 aiocqhttp 群聊。"
         group_id = _get_group_id(event)
         config_group_id = _state_group_id(event, group_id)
         if not group_id:
             return "千机聆阙：请在群聊中使用这个指令。"
         if not self.config.enabled:
             return "千机聆阙：总开关已关闭，请先在 WebUI 启用插件。"
-        for candidate in {group_id, config_group_id}:
+        for candidate in _group_key_candidates(
+            event,
+            group_id,
+            config_group_id,
+            include_bare=not _is_scoped_group_key(config_group_id),
+        ):
             if candidate in self.config.disabled_groups:
                 self.config.disabled_groups.remove(candidate)
-        if self.config.enabled_groups and config_group_id not in self.config.enabled_groups:
+        if (
+            not self.config.enables_all_groups()
+            and config_group_id not in self.config.enabled_groups
+        ):
             self.config.enabled_groups.append(config_group_id)
         self.config.save()
+        if not _is_group_enabled(self.config, group_id, config_group_id):
+            return "千机聆阙：已写入当前实例启用，但裸群号禁用安全阀仍生效；请在 WebUI 移除对应禁用项后再试。"
         return "千机聆阙：已开启当前群。"
 
     def disable_group(self, event: Any) -> str:
+        if not _is_supported_platform(event):
+            return "千机聆阙：当前只支持 aiocqhttp 群聊。"
         group_id = _get_group_id(event)
         config_group_id = _state_group_id(event, group_id)
         if not group_id:
@@ -630,6 +732,8 @@ class QianjiLingqueRuntime:
         return "千机聆阙：已关闭当前群。"
 
     def set_mode(self, event: Any, mode: str) -> str:
+        if not _is_supported_platform(event):
+            return "千机聆阙：当前只支持 aiocqhttp 群聊。"
         group_id = _get_group_id(event)
         config_group_id = _state_group_id(event, group_id)
         if not group_id:
@@ -653,33 +757,140 @@ class QianjiLingqueRuntime:
             return "千机聆阙：还没有判定记录。"
         return f"千机聆阙：{state.last_decision}"
 
+    def _should_track_external_event(self, event: Any) -> bool:
+        return _is_trackable_group_event(self.config, event)
+
+    def _sync_protected_context_groups(self) -> None:
+        max_groups = self.config.max_tracked_groups
+        protected_group_ids: set[str] = set()
+        if max_groups > 0:
+            for pending in sorted(
+                self._pending_replies.values(),
+                key=lambda item: item.started_at,
+                reverse=True,
+            ):
+                if pending.group_id:
+                    protected_group_ids.add(pending.group_id)
+                if len(protected_group_ids) >= max_groups:
+                    break
+        self.context_store.set_protected_groups(protected_group_ids)
+
 
 def _get_group_id(event: Any) -> str:
     return group_id_from_event(event)
 
 
+def _event_unified_msg_origin(event: Any) -> str:
+    return str(getattr(event, "unified_msg_origin", "") or "").strip()
+
+
 def _state_group_id(event: Any, group_id: str) -> str:
     if not group_id:
         return ""
+    unified_origin = _event_unified_msg_origin(event)
+    if _is_valid_group_unified_origin(unified_origin, group_id, event):
+        return unified_origin
     platform_id = _event_platform_id(event)
     platform_name = _event_platform_name(event)
-    if platform_id and platform_id != platform_name:
+    if platform_id:
         return f"{platform_id}:{group_id}"
+    if platform_name:
+        return f"{platform_name}:{group_id}"
     return group_id
+
+
+def _legacy_platform_group_id(event: Any | None, group_id: str) -> str:
+    if not group_id:
+        return ""
+    platform_id = _event_platform_id(event) if event is not None else ""
+    platform_name = _event_platform_name(event) if event is not None else ""
+    platform = platform_id or platform_name
+    return f"{platform}:{group_id}" if platform else ""
+
+
+def _group_key_candidates(
+    event: Any | None,
+    group_id: str,
+    state_group_id: str = "",
+    *,
+    include_bare: bool = True,
+) -> list[str]:
+    candidates: list[str] = []
+    raw_candidates = [
+        state_group_id,
+        _legacy_platform_group_id(event, group_id),
+        _legacy_key_from_state_group_id(state_group_id, group_id),
+    ]
+    if include_bare:
+        raw_candidates.append(group_id)
+    for candidate in raw_candidates:
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _legacy_key_from_state_group_id(state_group_id: str, group_id: str) -> str:
+    if not state_group_id or not group_id:
+        return ""
+    marker = ":GroupMessage:"
+    if marker in state_group_id and state_group_id.endswith(group_id):
+        platform_id = state_group_id.split(":", 1)[0]
+        return f"{platform_id}:{group_id}" if platform_id else ""
+    return ""
+
+
+def _is_valid_group_unified_origin(unified_origin: str, group_id: str, event: Any | None = None) -> bool:
+    if not unified_origin or not group_id:
+        return False
+    parts = unified_origin.split(":", 2)
+    if len(parts) != 3 or not parts[0] or parts[1] != "GroupMessage" or parts[2] != group_id:
+        return False
+    platform_id = _event_platform_id(event) if event is not None else ""
+    return not platform_id or parts[0] == platform_id
+
+
+def _is_scoped_group_key(value: str) -> bool:
+    return ":" in value
 
 
 def _is_group_enabled(config: PluginConfig, group_id: str, state_group_id: str) -> bool:
     if not config.enabled:
         return False
-    if state_group_id in config.disabled_groups or group_id in config.disabled_groups:
+    disabled_candidates = _group_key_candidates(None, group_id, state_group_id, include_bare=True)
+    if any(candidate in config.disabled_groups for candidate in disabled_candidates):
         return False
-    if not config.enabled_groups:
+    if config.enables_all_groups():
         return True
-    return state_group_id in config.enabled_groups or group_id in config.enabled_groups
+    if not config.enabled_groups:
+        return False
+    enabled_candidates = _group_key_candidates(
+        None,
+        group_id,
+        state_group_id,
+        include_bare=not _is_scoped_group_key(state_group_id),
+    )
+    return any(candidate in config.enabled_groups for candidate in enabled_candidates)
+
+
+def _is_trackable_group_event(config: PluginConfig, event: Any) -> bool:
+    if not _is_supported_platform(event):
+        return False
+    group_id = _get_group_id(event)
+    if not group_id:
+        return False
+    return _is_group_enabled(config, group_id, _state_group_id(event, group_id))
 
 
 def _effective_mode(config: PluginConfig, group_id: str, state_group_id: str) -> str:
-    return config.group_modes.get(state_group_id, config.effective_mode(group_id))
+    for candidate in _group_key_candidates(
+        None,
+        group_id,
+        state_group_id,
+        include_bare=not _is_scoped_group_key(state_group_id),
+    ):
+        if candidate in config.group_modes:
+            return config.group_modes[candidate]
+    return config.mode
 
 
 def _decision_config_for_group(config: PluginConfig, group_id: str, state_group_id: str) -> PluginConfig:
@@ -689,26 +900,18 @@ def _decision_config_for_group(config: PluginConfig, group_id: str, state_group_
         config,
         enabled_groups=_mirror_group_entries(config.enabled_groups, group_id, state_group_id),
         disabled_groups=_mirror_group_entries(config.disabled_groups, group_id, state_group_id),
-        group_modes=_mirror_group_mode_entries(config.group_modes, group_id, state_group_id),
+        group_modes={state_group_id: _effective_mode(config, group_id, state_group_id)},
         source=None,
     )
 
 
 def _mirror_group_entries(values: list[str], group_id: str, state_group_id: str) -> list[str]:
     mirrored = list(values)
-    if group_id in values and state_group_id not in mirrored:
+    candidates = _group_key_candidates(None, group_id, state_group_id, include_bare=True)
+    if any(candidate in values for candidate in candidates) and state_group_id not in mirrored:
         mirrored.append(state_group_id)
     if state_group_id in values and group_id not in mirrored:
         mirrored.append(group_id)
-    return mirrored
-
-
-def _mirror_group_mode_entries(values: dict[str, str], group_id: str, state_group_id: str) -> dict[str, str]:
-    mirrored = dict(values)
-    if group_id in values and state_group_id not in mirrored:
-        mirrored[state_group_id] = values[group_id]
-    if state_group_id in values and group_id not in mirrored:
-        mirrored[group_id] = values[state_group_id]
     return mirrored
 
 
@@ -982,16 +1185,7 @@ def _payload_int(payload: dict[str, Any], key: str) -> int:
 
 
 def _disable_agent_tools(request: Any, run_context: Any) -> None:
-    try:
-        setattr(request, "func_tool", None)
-    except Exception:
-        pass
-    system_prompt = getattr(request, "system_prompt", None)
-    if isinstance(system_prompt, str):
-        try:
-            setattr(request, "system_prompt", _strip_tool_prompt_text(system_prompt))
-        except Exception:
-            pass
+    _disable_provider_request_tools(request)
     messages = getattr(run_context, "messages", None)
     if not isinstance(messages, list):
         return
@@ -1006,30 +1200,175 @@ def _disable_agent_tools(request: Any, run_context: Any) -> None:
                 pass
 
 
+def _disable_provider_request_tools(request: Any) -> None:
+    try:
+        setattr(request, "func_tool", None)
+    except Exception:
+        pass
+    system_prompt = getattr(request, "system_prompt", None)
+    if isinstance(system_prompt, str):
+        try:
+            setattr(request, "system_prompt", _strip_tool_prompt_text(system_prompt))
+        except Exception:
+            pass
+
+
 def _strip_tool_prompt_text(text: str) -> str:
-    lines = []
-    skip_next_workspace_line = False
-    for line in text.splitlines():
+    lines: list[str] = []
+    raw_lines = text.splitlines()
+    index = 0
+    while index < len(raw_lines):
+        line = raw_lines[index]
         stripped = line.strip()
-        if stripped.startswith("When using tools:"):
+        if stripped.lower() == "## skills" and _looks_like_astrbot_skills_block(raw_lines, index):
+            index = _astrbot_skills_block_end(raw_lines, index)
             continue
-        if stripped.startswith("You MUST NOT return an empty response"):
+        if _is_tool_prompt_line(stripped):
+            index = _skip_sdk_workspace_block(raw_lines, index + 1)
             continue
-        if stripped.startswith("You have access to the host local environment"):
-            continue
-        if stripped.startswith("You have access to a sandboxed environment"):
-            continue
-        if stripped.startswith("Current workspace you can use:"):
-            skip_next_workspace_line = True
-            continue
-        if skip_next_workspace_line and (
-            "perform all file-related operations" in stripped
-            or "Unless the user explicitly" in stripped
-        ):
-            continue
-        skip_next_workspace_line = False
         lines.append(line)
+        index += 1
     return "\n".join(lines).strip()
+
+
+def _looks_like_astrbot_skills_block(lines: list[str], start_index: int) -> bool:
+    window = "\n".join(line.strip() for line in lines[start_index + 1 : start_index + 12])
+    lowered = window.lower()
+    return (
+        "you have specialized skills" in lowered
+        and "`skill.md`" in lowered
+        and (
+            "### available skills" in lowered
+            or "### skill rules" in lowered
+            or "**failure handling**" in lowered
+        )
+    )
+
+
+def _astrbot_skills_block_end(lines: list[str], start_index: int) -> int:
+    rules_start = _actual_skill_rules_start(lines, start_index)
+    if rules_start is not None:
+        end_index = _actual_skill_rules_end(lines, rules_start, len(lines))
+        if end_index is not None:
+            return end_index
+    tool_prompt_index = _next_tool_prompt_index(lines, start_index + 1)
+    if tool_prompt_index is not None:
+        return tool_prompt_index
+    return len(lines)
+
+
+def _actual_skill_rules_start(lines: list[str], start_index: int) -> int | None:
+    for index in range(start_index + 1, len(lines)):
+        if lines[index].strip().lower() != "### skill rules":
+            continue
+        if not _has_skill_file_anchor(lines, start_index, index):
+            continue
+        if _actual_skill_rules_end(lines, index, len(lines)) is not None:
+            return index
+    return None
+
+
+def _has_skill_file_anchor(lines: list[str], start_index: int, rules_start: int) -> bool:
+    for index in range(rules_start - 1, start_index, -1):
+        stripped = lines[index].strip()
+        if _is_tool_prompt_line(stripped):
+            return False
+        if stripped.startswith("File: `"):
+            return True
+    return False
+
+
+def _actual_skill_rules_end(lines: list[str], rules_start: int, end_index: int) -> int | None:
+    expected: list[tuple[str, str]] = [
+        ("1. **Discovery**", "complete skill inventory"),
+        ("2. **When to trigger**", "Use a skill"),
+        ("3. **Mandatory grounding**", "first read its `SKILL.md`"),
+        ("4. **Progressive disclosure**", "Load only what is directly"),
+        ("5. **Coordination**", "multiple skills apply"),
+        ("6. **Context hygiene**", "Avoid deep reference chasing"),
+        ("7. **Failure handling**", "continue with the best alternative"),
+    ]
+    cursor = rules_start + 1
+    last_match: int | None = None
+    for prefix, marker in expected:
+        matched_index = _find_skill_rule_line(lines, cursor, end_index, prefix, marker)
+        if matched_index is None:
+            return None
+        last_match = matched_index
+        cursor = matched_index + 1
+    return last_match + 1 if last_match is not None else None
+
+
+def _find_skill_rule_line(
+    lines: list[str],
+    start_index: int,
+    end_index: int,
+    prefix: str,
+    marker: str,
+) -> int | None:
+    for index in range(start_index, end_index):
+        stripped = lines[index].strip()
+        if stripped.startswith(prefix) and marker in stripped:
+            return index
+    return None
+
+
+def _next_nonempty_line_index(lines: list[str], start_index: int, end_index: int) -> int | None:
+    for index in range(start_index, end_index):
+        if lines[index].strip():
+            return index
+    return None
+
+
+def _next_tool_prompt_index(lines: list[str], start_index: int) -> int | None:
+    for index in range(start_index, len(lines)):
+        if _is_tool_prompt_line(lines[index].strip()):
+            return index
+    return None
+
+
+def _is_tool_prompt_line(stripped: str) -> bool:
+    if stripped in SDK_TOOL_PROMPTS:
+        return True
+    return not SDK_TOOL_PROMPTS and stripped in KNOWN_TOOL_PROMPTS
+
+
+def _is_workspace_prompt_line(stripped: str) -> bool:
+    if not stripped.startswith("Current workspace you can use: `"):
+        return False
+    if not stripped.endswith("`"):
+        return False
+    workspace_path = stripped.removeprefix("Current workspace you can use: `").removesuffix("`")
+    return _is_astrbot_workspace_path(workspace_path)
+
+
+def _is_workspace_followup_line(stripped: str) -> bool:
+    return (
+        stripped
+        == "Unless the user explicitly specifies a different directory, perform all file-related operations in this workspace."
+    )
+
+
+def _skip_sdk_workspace_block(lines: list[str], start_index: int) -> int:
+    if start_index >= len(lines):
+        return start_index
+    if not _is_workspace_prompt_line(lines[start_index].strip()):
+        return start_index
+    followup_index = start_index + 1
+    if followup_index >= len(lines) or not _is_workspace_followup_line(lines[followup_index].strip()):
+        return start_index
+    return followup_index + 1
+
+
+def _is_astrbot_workspace_path(path: str) -> bool:
+    if not ASTRBOT_WORKSPACES_PATH:
+        return False
+    try:
+        normalized_path = os.path.realpath(path)
+        common_path = os.path.commonpath([ASTRBOT_WORKSPACES_PATH, normalized_path])
+    except (OSError, ValueError):
+        return False
+    return common_path == ASTRBOT_WORKSPACES_PATH
 
 
 def _get_event_result(event: Any) -> Any:
