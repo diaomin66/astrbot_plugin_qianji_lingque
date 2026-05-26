@@ -18,8 +18,8 @@
 
 1. `FastGate`：本地忽略命令、空消息、bot 自己、连续发言等。
 2. `ScoreGate`：本地评分，综合 @/引用、问题意图、求助意图、近期 bot 发言、群友互聊、冷却和模式。
-3. `GrayArea`：灰区消息默认不调用模型；只有被明确点名或 wake 时交给 AstrBot 会话模型。
-4. `ReplyComposer`：通过 AstrBot `request_llm` 生成自然回复，复用当前会话、人设和基础媒体能力。
+3. `TimingGate`：强求助、常见疑问或接近回复阈值的灰区消息调用一次短超时 LLM 节奏判断，只输出 `reply | wait | ignore`；低置信 `wait/ignore`、失败或超时后，如果本地信号明显像强求助，则兜底接话；弱疑问只进入 TimingGate，不在节奏判断关闭时直接兜底；高置信 `wait/ignore` 会被尊重。
+4. `ReplyComposer`：优先通过 AstrBot `request_llm` 生成自然回复，复用当前会话、人设和基础媒体能力；不适合主动 ProviderRequest 的第三方 runner 只在灰区求助时尝试短文本直发兜底。
 
 ## Commands
 
@@ -39,16 +39,20 @@
 - `max_tracked_groups`: 最多保留群状态数。
 - `group_ttl_seconds`: 群状态无活动后的清理时间。
 - `takeover_explicit_mentions`: 是否接管 @/引用/wake 场景，避免默认 LLM 重复回答。
-- `log_decisions_enabled`: 是否在 AstrBot 日志中输出读空气判定、计划调用 LLM、实际调用 LLM 和发送收尾信息，默认关闭。
+- `llm_gate_enabled`: 是否启用灰区轻量 LLM 节奏判断，默认开启；强求助、常见疑问或接近回复阈值的灰区会调用，普通闲聊灰区不会调用。
+- `llm_gate_timeout_seconds`: 灰区节奏判断和第三方 runner 直发兜底超时，默认 1.5 秒，超时安全降级或本地兜底。
+- `llm_gate_fallback_score`: 灰区本地兜底分数，默认 0.4，用于覆盖约 0.42 的强求助灰区；弱疑问只进入 TimingGate；高置信 TimingGate `wait/ignore` 不会被本地兜底强行覆盖。
+- `log_decisions_enabled`: 是否在 AstrBot 日志中输出读空气判定、计划正式回复 LLM、TimingGate 实际调用 LLM、正式回复实际调用 LLM 和发送收尾信息，默认开启但隐藏原文。
 - `log_message_excerpt_enabled`: 是否在日志中输出最多 80 字消息摘要，默认关闭，仅建议临时排障使用。
 
 ## Performance Strategy
 
-- 默认不对灰区消息调用 LLM。
+- 只对强求助、常见疑问或接近回复阈值的灰区消息调用轻量 TimingGate；低分消息和普通闲聊灰区不调用模型，高分消息直接进入正式回复。
+- TimingGate 默认 1.5 秒超时；低置信 `wait/ignore`、超时、异常或非法 JSON 时，强求助型灰区消息会本地兜底为 `reply`，弱疑问和普通灰区仍 `wait`。
 - 每群独立冷却，bot 刚回复后更克制。
 - 每群只保留短期环形上下文，且限制总群数和 TTL。
-- 复杂媒体、远程媒体和第三方 runner 场景放行 AstrBot 默认链路。
-- 日志开关默认关闭；开启后普通跳过判定使用 DEBUG，关键 LLM 生命周期使用 INFO，并默认隐藏群聊原文。
+- 复杂媒体、远程媒体场景放行 AstrBot 默认链路；第三方 runner 的灰区求助会用灰区短超时尝试直发兜底，失败后放行默认链路，但默认链路未必会回复。
+- 判定日志默认开启但隐藏群聊原文；所有读空气判定和关键 LLM 生命周期使用 INFO，便于用户排障。
 
 ## Test Plan
 

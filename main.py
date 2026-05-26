@@ -53,31 +53,31 @@ class QianjiLingquePlugin(Star):
     async def read_air(self) -> None:
         pass
 
-    @read_air.command("状态")
+    @read_air.command("状态", alias={"查"})
     async def lingque_status(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         yield event.plain_result(self.runtime.render_status(event))
         event.stop_event()
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @read_air.command("开启")
+    @read_air.command("开启", alias={"开"})
     async def lingque_enable(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         yield event.plain_result(self.runtime.enable_group(event))
         event.stop_event()
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @read_air.command("关闭")
+    @read_air.command("关闭", alias={"关"})
     async def lingque_disable(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         yield event.plain_result(self.runtime.disable_group(event))
         event.stop_event()
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @read_air.command("模式")
+    @read_air.command("模式", alias={"模"})
     async def lingque_mode(self, event: AstrMessageEvent, mode: str = "") -> AsyncIterator[Any]:
         message = self.runtime.set_mode(event, mode)
         yield event.plain_result(message)
         event.stop_event()
 
-    @read_air.command("原因")
+    @read_air.command("原因", alias={"因"})
     async def lingque_reason(self, event: AstrMessageEvent) -> AsyncIterator[Any]:
         yield event.plain_result(self.runtime.render_last_reason(event))
         event.stop_event()

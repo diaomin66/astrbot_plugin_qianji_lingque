@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import base64
 import binascii
+from dataclasses import dataclass
 from typing import Any
+from typing import Literal
 from urllib.request import url2pathname
 from urllib.parse import urlparse
 
 from .context import GroupState
 from .event_utils import MessageSnapshot
-from .prompts import build_reply_prompt, build_reply_system_prompt
+from .prompts import (
+    TIMING_GATE_SYSTEM_PROMPT,
+    build_reply_prompt,
+    build_reply_system_prompt,
+    build_timing_gate_prompt,
+)
 
 try:
     from astrbot.core.message.components import At, Image, Plain, Record, Reply
@@ -30,6 +38,22 @@ ASTRBOT_MEDIA_COMPONENTS = tuple(
 
 MAX_BASE64_MEDIA_LENGTH = 700_000
 MAX_LOCAL_MEDIA_BYTES = 1_500_000
+TimingAction = Literal["reply", "wait", "ignore"]
+
+
+@dataclass(frozen=True)
+class TimingGateResult:
+    action: TimingAction
+    confidence: float
+    reason: str
+    called_llm: bool
+
+
+@dataclass(frozen=True)
+class DirectReplyResult:
+    text: str
+    reason: str
+    called_llm: bool
 
 
 class LLMClient:
@@ -39,6 +63,91 @@ class LLMClient:
 
     def extract_visible_reply(self, response: Any) -> str:
         return sanitize_reply(extract_completion_text(response))
+
+    async def generate_direct_reply(
+        self,
+        event: Any,
+        snapshot: MessageSnapshot,
+        state: GroupState,
+        *,
+        decision_reason: str,
+        timeout_seconds: float,
+    ) -> DirectReplyResult:
+        generate = getattr(self.context, "llm_generate", None)
+        if not callable(generate):
+            self.last_error = "当前 AstrBot 上下文不支持 llm_generate。"
+            return DirectReplyResult("", self.last_error, False)
+        provider_id = await self._current_provider_id(event)
+        if not provider_id:
+            return DirectReplyResult("", self.last_error or "未找到当前聊天模型。", False)
+        try:
+            response = await asyncio.wait_for(
+                generate(
+                    chat_provider_id=provider_id,
+                    prompt=build_reply_prompt(snapshot),
+                    system_prompt=build_reply_system_prompt(snapshot, state, decision_reason),
+                    tools=None,
+                    contexts=[],
+                ),
+                timeout=max(0.2, timeout_seconds),
+            )
+        except asyncio.TimeoutError:
+            self.last_error = "直发兜底回复超时。"
+            return DirectReplyResult("", self.last_error, True)
+        except Exception as exc:
+            self.last_error = f"直发兜底回复失败：{exc.__class__.__name__}"
+            return DirectReplyResult("", self.last_error, True)
+        reply = self.extract_visible_reply(response)
+        if not reply:
+            self.last_error = "直发兜底回复为空。"
+            return DirectReplyResult("", self.last_error, True)
+        self.last_error = ""
+        return DirectReplyResult(reply, "直发兜底回复完成。", True)
+
+    async def judge_timing(
+        self,
+        event: Any,
+        snapshot: MessageSnapshot,
+        state: GroupState,
+        *,
+        local_score: float,
+        local_reason: str,
+        mode_label: str,
+        timeout_seconds: float,
+    ) -> TimingGateResult:
+        generate = getattr(self.context, "llm_generate", None)
+        if not callable(generate):
+            self.last_error = "当前 AstrBot 上下文不支持 llm_generate。"
+            return TimingGateResult("wait", local_score, self.last_error, False)
+        provider_id = await self._current_provider_id(event)
+        if not provider_id:
+            return TimingGateResult("wait", local_score, self.last_error or "未找到当前聊天模型。", False)
+        prompt = build_timing_gate_prompt(
+            snapshot,
+            state,
+            local_score=local_score,
+            local_reason=local_reason,
+            mode_label=mode_label,
+        )
+        try:
+            response = await asyncio.wait_for(
+                generate(
+                    chat_provider_id=provider_id,
+                    prompt=prompt,
+                    system_prompt=TIMING_GATE_SYSTEM_PROMPT,
+                    tools=None,
+                    contexts=[],
+                ),
+                timeout=max(0.2, timeout_seconds),
+            )
+        except asyncio.TimeoutError:
+            self.last_error = "TimingGate 超时。"
+            return TimingGateResult("wait", local_score, "节奏判断超时", True)
+        except Exception as exc:
+            self.last_error = f"TimingGate 调用失败：{exc.__class__.__name__}"
+            return TimingGateResult("wait", local_score, self.last_error, True)
+        self.last_error = ""
+        return parse_timing_gate_response(extract_completion_text(response), local_score)
 
     async def build_reply_request(
         self,
@@ -94,6 +203,27 @@ class LLMClient:
             self.last_error = f"当前 provider runner（{provider_type}）不适合插件主动 ProviderRequest，交给默认链路。"
             return False
         return True
+
+    async def reply_request_supported(self, event: Any) -> bool:
+        return await self._provider_request_supported(event)
+
+    async def _current_provider_id(self, event: Any) -> str:
+        getter = getattr(self.context, "get_current_chat_provider_id", None)
+        if not callable(getter):
+            self.last_error = "当前 AstrBot 上下文缺少 get_current_chat_provider_id。"
+            return ""
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        try:
+            return str(await getter(umo=umo) or "")
+        except TypeError:
+            try:
+                return str(await getter(umo) or "")
+            except Exception as exc:
+                self.last_error = f"获取当前聊天模型失败：{exc.__class__.__name__}"
+                return ""
+        except Exception as exc:
+            self.last_error = f"获取当前聊天模型失败：{exc.__class__.__name__}"
+            return ""
 
     def _agent_runner_type(self, event: Any) -> str:
         config_getter = getattr(self.context, "get_config", None)
@@ -188,6 +318,46 @@ def sanitize_reply(text: str) -> str:
     if _looks_like_structured_or_tool_output(cleaned):
         cleaned = _extract_safe_json_reply(cleaned)
     return cleaned[:500].strip()
+
+
+def parse_timing_gate_response(text: str, fallback_confidence: float) -> TimingGateResult:
+    payload = _load_json_object(text)
+    if not isinstance(payload, dict):
+        return TimingGateResult("wait", fallback_confidence, "节奏判断返回非 JSON", True)
+    action = str(payload.get("action", "") or "").strip().lower()
+    if action not in {"reply", "wait", "ignore"}:
+        return TimingGateResult("wait", fallback_confidence, "节奏判断 action 无效", True)
+    confidence = _safe_confidence(payload.get("confidence"), fallback_confidence)
+    reason = str(payload.get("reason", "") or "").strip()[:80] or "节奏判断完成"
+    return TimingGateResult(action, confidence, reason, True)
+
+
+def _load_json_object(text: str) -> dict[str, Any] | None:
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json|text)?", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"```$", "", cleaned).strip()
+    if cleaned.startswith("{"):
+        try:
+            value = json.loads(cleaned)
+        except json.JSONDecodeError:
+            value = None
+        return value if isinstance(value, dict) else None
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        value = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _safe_confidence(value: Any, fallback: float) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        confidence = fallback
+    return min(max(confidence, 0.0), 1.0)
 
 
 def _looks_like_structured_or_tool_output(text: str) -> bool:

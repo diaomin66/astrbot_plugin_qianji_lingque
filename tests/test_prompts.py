@@ -6,8 +6,10 @@ from qianji_lingque.context import GroupState
 from qianji_lingque.event_utils import MessageSnapshot
 from qianji_lingque.prompts import (
     REPLY_SYSTEM_PROMPT,
+    TIMING_GATE_SYSTEM_PROMPT,
     build_reply_prompt,
     build_reply_system_prompt,
+    build_timing_gate_prompt,
 )
 
 
@@ -37,6 +39,36 @@ class PromptTests(unittest.TestCase):
         self.assertIn('"recent_context"', system_prompt)
         self.assertIn("再次确认", system_prompt)
         self.assertIn("不要 JSON", system_prompt)
+
+    def test_timing_gate_prompt_only_asks_for_decision_json(self) -> None:
+        snapshot = MessageSnapshot(
+            group_id="group-1",
+            sender_id="user-1",
+            sender_name="群友",
+            message_id="msg-1",
+            self_id="bot-1",
+            text="这个有点怪呢，看看",
+            outline="",
+            timestamp=1.0,
+            mentions_bot=False,
+            replies_to_bot=False,
+        )
+        state = GroupState(group_id="group-1", max_messages=10)
+
+        prompt = build_timing_gate_prompt(
+            snapshot,
+            state,
+            local_score=0.42,
+            local_reason="本地评分处于灰区",
+            mode_label="普通",
+        )
+
+        self.assertIn("只输出一个 JSON", TIMING_GATE_SYSTEM_PROMPT)
+        self.assertIn("默认偏向 reply", TIMING_GATE_SYSTEM_PROMPT)
+        self.assertIn("不要照抄枚举说明", TIMING_GATE_SYSTEM_PROMPT)
+        self.assertIn("不要输出群聊回复正文", prompt)
+        self.assertIn('"local_gate"', prompt)
+        self.assertIn("这个有点怪呢，看看", prompt)
 
 
 if __name__ == "__main__":

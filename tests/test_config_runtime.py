@@ -252,22 +252,33 @@ class ConfigRuntimeTests(unittest.TestCase):
         self.assertEqual(raw["group_ttl_seconds"], 86400.0)
         self.assertEqual(raw["score_threshold_reply"], 0.78)
         self.assertEqual(raw["bot_aliases"], ["机器人"])
-        self.assertFalse(raw["log_decisions_enabled"])
+        self.assertTrue(raw["llm_gate_enabled"])
+        self.assertEqual(raw["llm_gate_timeout_seconds"], 1.5)
+        self.assertEqual(raw["llm_gate_fallback_score"], 0.4)
+        self.assertTrue(raw["log_decisions_enabled"])
         self.assertFalse(raw["log_message_excerpt_enabled"])
         self.assertTrue(raw.saved)
 
-    def test_log_settings_are_opt_in(self) -> None:
+    def test_log_settings_default_on_and_message_excerpt_opt_in(self) -> None:
         default_config = PluginConfig.from_astrbot_config({})
         enabled_config = PluginConfig.from_astrbot_config(
             {
-                "log_decisions_enabled": True,
+                "log_decisions_enabled": False,
                 "log_message_excerpt_enabled": True,
+                "llm_gate_enabled": False,
+                "llm_gate_timeout_seconds": 0.1,
+                "llm_gate_fallback_score": 1.5,
             },
         )
 
-        self.assertFalse(default_config.log_decisions_enabled)
+        self.assertTrue(default_config.llm_gate_enabled)
+        self.assertEqual(default_config.llm_gate_timeout_seconds, 1.5)
+        self.assertTrue(default_config.log_decisions_enabled)
         self.assertFalse(default_config.log_message_excerpt_enabled)
-        self.assertTrue(enabled_config.log_decisions_enabled)
+        self.assertFalse(enabled_config.llm_gate_enabled)
+        self.assertEqual(enabled_config.llm_gate_timeout_seconds, 0.2)
+        self.assertEqual(enabled_config.llm_gate_fallback_score, 1.0)
+        self.assertFalse(enabled_config.log_decisions_enabled)
         self.assertTrue(enabled_config.log_message_excerpt_enabled)
 
     def test_save_trims_group_mode_keys(self) -> None:

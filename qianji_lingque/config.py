@@ -33,12 +33,15 @@ class PluginConfig:
     min_reply_interval_seconds: float = 18.0
     bot_cooldown_after_reply_seconds: float = 35.0
     reply_timeout_seconds: float = 12.0
+    llm_gate_enabled: bool = True
+    llm_gate_timeout_seconds: float = 1.5
+    llm_gate_fallback_score: float = 0.4
     max_tracked_groups: int = 200
     group_ttl_seconds: float = 86400.0
     score_threshold_reply: float = 0.78
     score_threshold_ignore: float = 0.35
     debug_explain_enabled: bool = True
-    log_decisions_enabled: bool = False
+    log_decisions_enabled: bool = True
     log_message_excerpt_enabled: bool = False
     takeover_explicit_mentions: bool = True
     bot_aliases: list[str] = field(default_factory=list)
@@ -68,12 +71,25 @@ class PluginConfig:
                 1200.0,
             ),
             reply_timeout_seconds=_clamp_float(data.get("reply_timeout_seconds"), 12.0, 1.0, 60.0),
+            llm_gate_enabled=_bool(data.get("llm_gate_enabled"), True),
+            llm_gate_timeout_seconds=_clamp_float(
+                data.get("llm_gate_timeout_seconds"),
+                1.5,
+                0.2,
+                10.0,
+            ),
+            llm_gate_fallback_score=_clamp_float(
+                data.get("llm_gate_fallback_score"),
+                0.4,
+                0.0,
+                1.0,
+            ),
             max_tracked_groups=_clamp_int(data.get("max_tracked_groups"), 200, 1, 2000),
             group_ttl_seconds=_clamp_float(data.get("group_ttl_seconds"), 86400.0, 60.0, 604800.0),
             score_threshold_reply=_clamp_float(data.get("score_threshold_reply"), 0.78, 0.0, 1.0),
             score_threshold_ignore=_clamp_float(data.get("score_threshold_ignore"), 0.35, 0.0, 1.0),
             debug_explain_enabled=_bool(data.get("debug_explain_enabled"), True),
-            log_decisions_enabled=_bool(data.get("log_decisions_enabled"), False),
+            log_decisions_enabled=_bool(data.get("log_decisions_enabled"), True),
             log_message_excerpt_enabled=_bool(data.get("log_message_excerpt_enabled"), False),
             takeover_explicit_mentions=_bool(data.get("takeover_explicit_mentions"), True),
             bot_aliases=_string_list(data.get("bot_aliases"), []),
@@ -101,6 +117,9 @@ class PluginConfig:
         self.source["min_reply_interval_seconds"] = self.min_reply_interval_seconds
         self.source["bot_cooldown_after_reply_seconds"] = self.bot_cooldown_after_reply_seconds
         self.source["reply_timeout_seconds"] = self.reply_timeout_seconds
+        self.source["llm_gate_enabled"] = self.llm_gate_enabled
+        self.source["llm_gate_timeout_seconds"] = self.llm_gate_timeout_seconds
+        self.source["llm_gate_fallback_score"] = self.llm_gate_fallback_score
         self.source["max_tracked_groups"] = self.max_tracked_groups
         self.source["group_ttl_seconds"] = self.group_ttl_seconds
         self.source["score_threshold_reply"] = self.score_threshold_reply

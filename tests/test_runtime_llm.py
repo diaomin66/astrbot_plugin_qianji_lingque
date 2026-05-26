@@ -16,6 +16,7 @@ if SDK_PATH.exists() and str(SDK_PATH) not in sys.path:
     sys.path.insert(0, str(SDK_PATH))
 
 from qianji_lingque.config import PluginConfig
+from qianji_lingque.decision import Decision
 from qianji_lingque.runtime import QianjiLingqueRuntime
 
 JPEG_BASE64 = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 20 + b"\xff\xd9").decode()
@@ -97,6 +98,15 @@ class Video:
 class FakeProvider:
     def __init__(self, provider_type: str) -> None:
         self.provider_config = {"type": provider_type}
+
+
+class FakeDecisionEngine:
+    def __init__(self, action: str, confidence: float, reason: str, *, is_gray_area: bool = False) -> None:
+        self.decision = Decision(action, confidence, reason, is_gray_area=is_gray_area)
+
+    def decide(self, snapshot, state, config):
+        del snapshot, state, config
+        return self.decision
 
 
 def active_config(**kwargs) -> PluginConfig:
@@ -345,9 +355,12 @@ class RuntimeLLMTests(unittest.TestCase):
         self.assertNotIn("enable_streaming", event.extra)
         self.assertEqual(context.prompts, [])
 
-    def test_decision_logging_is_off_by_default(self) -> None:
+    def test_decision_logging_can_be_disabled(self) -> None:
         context = FakeContext([])
-        runtime = QianjiLingqueRuntime(context, active_config(bot_aliases=["机器人"]))
+        runtime = QianjiLingqueRuntime(
+            context,
+            active_config(log_decisions_enabled=False, bot_aliases=["机器人"]),
+        )
         event = FakeGroupEvent("机器人，帮我看看这个怎么弄？")
 
         with patch("qianji_lingque.runtime.logger.info") as info, patch(
@@ -370,12 +383,12 @@ class RuntimeLLMTests(unittest.TestCase):
             asyncio.run(_collect(runtime.handle_group_message(event)))
 
         rendered = _render_log_calls(info)
-        self.assertIn("计划调用LLM=是", rendered)
+        self.assertIn("计划正式回复LLM=是", rendered)
         self.assertIn("实际调用LLM=否", rendered)
         self.assertIn("已隐藏(长度=", rendered)
         self.assertNotIn("abc123", rendered)
 
-    def test_non_llm_decision_logging_uses_debug_without_message_excerpt(self) -> None:
+    def test_non_llm_decision_logging_uses_info_without_message_excerpt(self) -> None:
         context = FakeContext([])
         runtime = QianjiLingqueRuntime(
             context,
@@ -388,9 +401,10 @@ class RuntimeLLMTests(unittest.TestCase):
         ) as debug:
             asyncio.run(_collect(runtime.handle_group_message(event)))
 
-        rendered = _render_log_calls(debug)
-        self.assertEqual(info.call_count, 0)
-        self.assertIn("计划调用LLM=否", rendered)
+        rendered = _render_log_calls(info)
+        self.assertGreater(info.call_count, 0)
+        self.assertEqual(debug.call_count, 0)
+        self.assertIn("计划正式回复LLM=否", rendered)
         self.assertIn("已隐藏(长度=", rendered)
         self.assertNotIn("abc123", rendered)
 
@@ -406,7 +420,7 @@ class RuntimeLLMTests(unittest.TestCase):
             asyncio.run(_collect_with_request_hook(runtime, event))
 
         rendered = _render_log_calls(info)
-        self.assertIn("计划调用LLM=是", rendered)
+        self.assertIn("计划正式回复LLM=是", rendered)
         self.assertIn("实际调用LLM=是", rendered)
 
     def test_message_excerpt_logging_is_explicit_opt_in(self) -> None:
@@ -425,6 +439,24 @@ class RuntimeLLMTests(unittest.TestCase):
             asyncio.run(_collect(runtime.handle_group_message(event)))
 
         self.assertIn("机器人，帮我看看这个怎么弄？", _render_log_calls(info))
+
+    def test_timing_gate_logging_reports_actual_llm_call(self) -> None:
+        context = FakeContext(['{"action":"wait","confidence":0.86,"reason":"还没说完"}'])
+        runtime = QianjiLingqueRuntime(
+            context,
+            active_config(log_decisions_enabled=True, bot_aliases=["机器人"]),
+        )
+        event = FakeGroupEvent("这个怎么办，帮我看看")
+
+        with patch("qianji_lingque.runtime.logger.info") as info:
+            asyncio.run(_collect(runtime.handle_group_message(event)))
+
+        rendered = _render_log_calls(info)
+        self.assertIn("TimingGate节奏判断", rendered)
+        self.assertIn("实际调用LLM=是", rendered)
+        self.assertIn("TimingGate动作=wait", rendered)
+        self.assertIn("最终动作=wait", rendered)
+        self.assertNotIn("计划正式回复LLM=是", rendered)
 
     def test_llm_request_keeps_conversation_without_polluting_user_prompt(self) -> None:
         context = FakeContext([])
@@ -845,16 +877,237 @@ class RuntimeLLMTests(unittest.TestCase):
 
         self.assertIsInstance(results[0], AstrBotProviderRequest)
 
-    def test_gray_decision_skips_model_on_main_chain(self) -> None:
+    def test_gray_decision_uses_local_fallback_when_timing_gate_disabled(self) -> None:
         context = FakeContext(['{"action":"reply","reason":"可以接话"}'])
+        runtime = QianjiLingqueRuntime(
+            context,
+            active_config(bot_aliases=["机器人"], llm_gate_enabled=False),
+        )
+        event = FakeGroupEvent("这个怎么办，帮我看看")
+
+        results = asyncio.run(_collect_with_request_hook(runtime, event))
+
+        self.assertEqual(results, event.llm_requests)
+        self.assertFalse(event.stopped)
+        self.assertEqual(context.prompts, [])
+        self.assertIn("节奏判断关闭时本地兜底接话", runtime.context_store.peek_group("group-1").last_decision)
+
+    def test_gray_decision_uses_timing_gate_to_reply(self) -> None:
+        context = FakeContext(['{"action":"reply","confidence":0.86,"reason":"像在求助"}'])
         runtime = QianjiLingqueRuntime(context, active_config(bot_aliases=["机器人"]))
-        event = FakeGroupEvent("这个有点怪呢，看看")
+        event = FakeGroupEvent("这个怎么办，帮我看看")
+
+        results = asyncio.run(_collect_with_request_hook(runtime, event))
+
+        self.assertEqual(results, event.llm_requests)
+        self.assertEqual(len(context.prompts), 1)
+        self.assertIn("是否应该接话", context.prompts[0])
+        last_decision = runtime.context_store.peek_group("group-1").last_decision
+        self.assertIn("reply (0.86)：灰区 TimingGate：像在求助", last_decision)
+        self.assertNotIn("为避免阻塞插件链", last_decision)
+
+    def test_gray_timing_gate_wait_does_not_reply(self) -> None:
+        context = FakeContext(['{"action":"wait","confidence":0.86,"reason":"还没说完"}'])
+        runtime = QianjiLingqueRuntime(context, active_config(bot_aliases=["机器人"]))
+        event = FakeGroupEvent("普通接话")
+        runtime.decision_engine = FakeDecisionEngine("wait", 0.70, "本地评分接近回复阈值", is_gray_area=True)
 
         results = asyncio.run(_collect(runtime.handle_group_message(event)))
 
         self.assertEqual(results, [])
-        self.assertFalse(event.stopped)
+        self.assertEqual(event.llm_requests, [])
+        self.assertEqual(len(context.prompts), 1)
+        self.assertIn("wait (0.86)：灰区 TimingGate：还没说完", runtime.context_store.peek_group("group-1").last_decision)
+
+    def test_gray_wait_042_with_help_signal_falls_back_to_reply(self) -> None:
+        context = FakeContext(['{"action":"wait","confidence":0.60,"reason":"保守等待"}'])
+        runtime = QianjiLingqueRuntime(context, active_config(mode="active", bot_aliases=["机器人"]))
+        event = FakeGroupEvent("这个呢")
+        runtime.decision_engine = FakeDecisionEngine("wait", 0.42, "本地评分处于灰区", is_gray_area=True)
+
+        results = asyncio.run(_collect_with_request_hook(runtime, event))
+
+        self.assertEqual(results, event.llm_requests)
+        state = runtime.context_store.peek_group("group-1")
+        self.assertIn("reply (0.58)：灰区 TimingGate 后本地兜底接话", state.last_decision)
+        self.assertNotIn("wait (0.42)", state.last_decision)
+
+    def test_real_score_042_question_falls_back_from_timing_gate_wait(self) -> None:
+        context = FakeContext(['{"action":"wait","confidence":0.60,"reason":"保守等待"}'])
+        runtime = QianjiLingqueRuntime(context, active_config(mode="active", bot_aliases=["机器人"]))
+        event = FakeGroupEvent("这是什么")
+
+        results = asyncio.run(_collect_with_request_hook(runtime, event))
+
+        self.assertEqual(results, event.llm_requests)
+        self.assertIn("灰区 TimingGate 后本地兜底接话", runtime.context_store.peek_group("group-1").last_decision)
+
+    def test_real_score_042_long_question_tail_uses_timing_gate_but_not_local_fallback(self) -> None:
+        context = FakeContext(['{"action":"wait","confidence":0.60,"reason":"保守等待"}'])
+        runtime = QianjiLingqueRuntime(context, active_config(mode="active", bot_aliases=["机器人"]))
+        event = FakeGroupEvent("这个设置一直这样是不是正常吗")
+
+        results = asyncio.run(_collect(runtime.handle_group_message(event)))
+
+        self.assertEqual(results, [])
+        self.assertEqual(len(context.prompts), 1)
+        last_decision = runtime.context_store.peek_group("group-1").last_decision
+        self.assertIn("wait (0.60)：灰区 TimingGate：保守等待", last_decision)
+        self.assertNotIn("wait (0.42)", last_decision)
+
+    def test_real_score_042_long_question_tail_waits_when_gate_disabled(self) -> None:
+        context = FakeContext([])
+        runtime = QianjiLingqueRuntime(
+            context,
+            active_config(mode="active", bot_aliases=["机器人"], llm_gate_enabled=False),
+        )
+        event = FakeGroupEvent("这个设置一直这样是不是正常吗")
+
+        results = asyncio.run(_collect(runtime.handle_group_message(event)))
+
+        self.assertEqual(results, [])
+        self.assertEqual(event.llm_requests, [])
         self.assertEqual(context.prompts, [])
+        self.assertIn("wait (0.42)", runtime.context_store.peek_group("group-1").last_decision)
+
+    def test_real_score_042_strong_long_question_falls_back_from_timing_gate_wait(self) -> None:
+        context = FakeContext(['{"action":"wait","confidence":0.60,"reason":"保守等待"}'])
+        runtime = QianjiLingqueRuntime(context, active_config(mode="active", bot_aliases=["机器人"]))
+        event = FakeGroupEvent("这个配置为什么一直保存不了")
+
+        results = asyncio.run(_collect_with_request_hook(runtime, event))
+
+        self.assertEqual(results, event.llm_requests)
+        last_decision = runtime.context_store.peek_group("group-1").last_decision
+        self.assertIn("灰区 TimingGate 后本地兜底接话", last_decision)
+        self.assertNotIn("wait (0.42)", last_decision)
+
+    def test_real_score_042_casual_question_variants_do_not_fallback(self) -> None:
+        for text in ("今天没什么特别的安排吗", "我们一起玩吗兄弟", "这有什么好说的吗", "好呢好呢"):
+            context = FakeContext([])
+            runtime = QianjiLingqueRuntime(
+                context,
+                active_config(mode="active", bot_aliases=["机器人"], llm_gate_enabled=False),
+            )
+            event = FakeGroupEvent(text)
+
+            results = asyncio.run(_collect(runtime.handle_group_message(event)))
+
+            self.assertEqual(results, [])
+            self.assertEqual(event.llm_requests, [])
+            self.assertNotIn("本地兜底接话", runtime.context_store.peek_group("group-1").last_decision)
+
+    def test_high_confidence_timing_gate_wait_for_help_signal_does_not_fallback(self) -> None:
+        context = FakeContext(['{"action":"wait","confidence":0.86,"reason":"群友可能还没说完"}'])
+        runtime = QianjiLingqueRuntime(context, active_config(mode="active", bot_aliases=["机器人"]))
+        event = FakeGroupEvent("这是什么")
+
+        results = asyncio.run(_collect(runtime.handle_group_message(event)))
+
+        self.assertEqual(results, [])
+        self.assertEqual(event.llm_requests, [])
+        self.assertIn("wait (0.86)：灰区 TimingGate：群友可能还没说完", runtime.context_store.peek_group("group-1").last_decision)
+
+    def test_low_confidence_timing_gate_ignore_for_help_signal_falls_back(self) -> None:
+        context = FakeContext(['{"action":"ignore","confidence":0.40,"reason":"误判闲聊"}'])
+        runtime = QianjiLingqueRuntime(context, active_config(mode="active", bot_aliases=["机器人"]))
+        event = FakeGroupEvent("这是什么")
+
+        results = asyncio.run(_collect_with_request_hook(runtime, event))
+
+        self.assertEqual(results, event.llm_requests)
+        self.assertIn("灰区 TimingGate 后本地兜底接话", runtime.context_store.peek_group("group-1").last_decision)
+
+    def test_gray_unavailable_042_with_help_signal_falls_back_to_reply(self) -> None:
+        context = FakeContext([])
+        context.llm_generate = None
+        runtime = QianjiLingqueRuntime(context, active_config(mode="active", bot_aliases=["机器人"]))
+        event = FakeGroupEvent("这个呢")
+        runtime.decision_engine = FakeDecisionEngine("wait", 0.42, "本地评分处于灰区", is_gray_area=True)
+
+        results = asyncio.run(_collect_with_request_hook(runtime, event))
+
+        self.assertEqual(results, event.llm_requests)
+        self.assertIn("本地兜底接话", runtime.context_store.peek_group("group-1").last_decision)
+
+    def test_gray_042_help_signal_falls_back_when_gate_disabled(self) -> None:
+        context = FakeContext([])
+        runtime = QianjiLingqueRuntime(
+            context,
+            active_config(mode="active", bot_aliases=["机器人"], llm_gate_enabled=False),
+        )
+        event = FakeGroupEvent("这个呢")
+        runtime.decision_engine = FakeDecisionEngine("wait", 0.42, "本地评分处于灰区", is_gray_area=True)
+
+        results = asyncio.run(_collect_with_request_hook(runtime, event))
+
+        self.assertEqual(results, event.llm_requests)
+        self.assertEqual(context.prompts, [])
+        self.assertIn("节奏判断关闭时本地兜底接话", runtime.context_store.peek_group("group-1").last_decision)
+
+    def test_gray_timing_gate_invalid_json_uses_local_fallback_for_help_signal(self) -> None:
+        context = FakeContext(["我觉得可以回"])
+        runtime = QianjiLingqueRuntime(context, active_config(bot_aliases=["机器人"]))
+        event = FakeGroupEvent("这个怎么办，帮我看看")
+
+        results = asyncio.run(_collect_with_request_hook(runtime, event))
+
+        self.assertEqual(results, event.llm_requests)
+        self.assertIn("本地兜底接话", runtime.context_store.peek_group("group-1").last_decision)
+
+    def test_weak_question_particles_do_not_trigger_gray_local_fallback(self) -> None:
+        context = FakeContext([])
+        runtime = QianjiLingqueRuntime(
+            context,
+            active_config(mode="active", bot_aliases=["机器人"], llm_gate_enabled=False),
+        )
+        event = FakeGroupEvent("我哪知道")
+        runtime.decision_engine = FakeDecisionEngine("wait", 0.42, "本地评分处于灰区", is_gray_area=True)
+
+        results = asyncio.run(_collect(runtime.handle_group_message(event)))
+
+        self.assertEqual(results, [])
+        self.assertEqual(event.llm_requests, [])
+        self.assertIn("wait (0.42)", runtime.context_store.peek_group("group-1").last_decision)
+
+    def test_casual_weak_question_markers_do_not_trigger_gray_local_fallback(self) -> None:
+        context = FakeContext([])
+        runtime = QianjiLingqueRuntime(
+            context,
+            active_config(mode="active", bot_aliases=["机器人"], llm_gate_enabled=False),
+        )
+        for text in ("没什么", "一起玩吗", "好呢"):
+            event = FakeGroupEvent(text)
+            runtime.decision_engine = FakeDecisionEngine("wait", 0.42, "本地评分处于灰区", is_gray_area=True)
+
+            results = asyncio.run(_collect(runtime.handle_group_message(event)))
+
+            self.assertEqual(results, [])
+            self.assertEqual(event.llm_requests, [])
+
+    def test_gray_timing_gate_unavailable_uses_local_fallback_for_help_signal(self) -> None:
+        context = FakeContext([])
+        context.llm_generate = None
+        runtime = QianjiLingqueRuntime(context, active_config(bot_aliases=["机器人"]))
+        event = FakeGroupEvent("这个怎么办，帮我看看")
+
+        results = asyncio.run(_collect_with_request_hook(runtime, event))
+
+        self.assertEqual(results, event.llm_requests)
+        self.assertIn("本地兜底接话", runtime.context_store.peek_group("group-1").last_decision)
+
+    def test_gray_timing_gate_timeout_uses_local_fallback_for_help_signal(self) -> None:
+        context = FakeContext(['{"action":"reply","confidence":0.9,"reason":"可以接"}'], delay=0.25)
+        runtime = QianjiLingqueRuntime(
+            context,
+            active_config(bot_aliases=["机器人"], llm_gate_timeout_seconds=0.2),
+        )
+        event = FakeGroupEvent("这个怎么办，帮我看看")
+
+        results = asyncio.run(_collect_with_request_hook(runtime, event))
+
+        self.assertEqual(results, event.llm_requests)
+        self.assertIn("本地兜底接话", runtime.context_store.peek_group("group-1").last_decision)
 
     def test_direct_reply_without_conversation_does_not_suppress_default(self) -> None:
         context = FakeContext([], with_conversation=False)
@@ -897,11 +1150,73 @@ class RuntimeLLMTests(unittest.TestCase):
         self.assertIsNotNone(state)
         self.assertEqual(list(state.messages), [])
 
+    def test_gray_timing_gate_uses_direct_fallback_for_unsupported_provider(self) -> None:
+        context = FakeContext(["可以，我先帮你看下。"], provider_type="dify")
+        runtime = QianjiLingqueRuntime(context, active_config(mode="active", bot_aliases=["机器人"]))
+        event = FakeGroupEvent("这是什么")
+
+        results = asyncio.run(_collect(runtime.handle_group_message(event)))
+
+        self.assertEqual(results, ["可以，我先帮你看下。"])
+        self.assertEqual(event.llm_requests, [])
+        self.assertTrue(event.stopped)
+        self.assertEqual(len(context.prompts), 1)
+        self.assertIn("这是什么", context.prompts[0])
+        self.assertIn("直发兜底", runtime.context_store.peek_group("group-1").last_decision)
+        state = runtime.context_store.peek_group("group-1")
+        self.assertIsNotNone(state)
+        self.assertIsNone(state.last_bot_message())
+        event.result = FakeResult([Plain("可以，我先帮你看下。")])
+        event._has_send_oper = True
+        runtime.record_after_message_sent(event)
+        self.assertEqual(state.last_bot_message().text, "可以，我先帮你看下。")
+
+    def test_agent_runner_direct_fallback_for_unsupported_gray_help(self) -> None:
+        context = FakeContext(["可以，我先帮你看下。"], agent_runner_type="dify")
+        runtime = QianjiLingqueRuntime(context, active_config(mode="active", bot_aliases=["机器人"]))
+        event = FakeGroupEvent("这是什么")
+
+        results = asyncio.run(_collect(runtime.handle_group_message(event)))
+
+        self.assertEqual(results, ["可以，我先帮你看下。"])
+        self.assertEqual(event.llm_requests, [])
+        self.assertTrue(event.stopped)
+        self.assertIn("直发兜底", runtime.context_store.peek_group("group-1").last_decision)
+
+    def test_unsupported_provider_direct_fallback_failure_keeps_default_chain_open(self) -> None:
+        context = FakeContext([""], provider_type="dify")
+        runtime = QianjiLingqueRuntime(context, active_config(mode="active", bot_aliases=["机器人"]))
+        event = FakeGroupEvent("这是什么")
+
+        results = asyncio.run(_collect(runtime.handle_group_message(event)))
+
+        self.assertEqual(results, [])
+        self.assertEqual(event.llm_requests, [])
+        self.assertFalse(event.stopped)
+        self.assertFalse(event.suppressed_default_llm)
+        self.assertIn("直发兜底失败", runtime.context_store.peek_group("group-1").last_decision)
+        self.assertIn("默认链路未必会回复", runtime.context_store.peek_group("group-1").last_decision)
+
+    def test_unsupported_provider_direct_fallback_timeout_keeps_default_chain_open(self) -> None:
+        context = FakeContext(["会超时"], provider_type="dify", delay=0.25)
+        runtime = QianjiLingqueRuntime(
+            context,
+            active_config(mode="active", bot_aliases=["机器人"], llm_gate_timeout_seconds=0.2),
+        )
+        event = FakeGroupEvent("这是什么")
+
+        results = asyncio.run(_collect(runtime.handle_group_message(event)))
+
+        self.assertEqual(results, [])
+        self.assertEqual(event.llm_requests, [])
+        self.assertFalse(event.stopped)
+        self.assertIn("直发兜底失败", runtime.context_store.peek_group("group-1").last_decision)
+
     def test_gray_message_does_not_swallow_direct_message(self) -> None:
         async def scenario() -> FakeGroupEvent:
             context = FakeContext(['{"action":"wait","reason":"还没说完"}'], delay=0.05)
             runtime = QianjiLingqueRuntime(context, active_config(bot_aliases=["机器人"]))
-            first = asyncio.create_task(_collect(runtime.handle_group_message(FakeGroupEvent("这个有点怪呢，看看"))))
+            first = asyncio.create_task(_collect(runtime.handle_group_message(FakeGroupEvent("这个怎么办，帮我看看"))))
             await asyncio.sleep(0.01)
 
             direct = FakeGroupEvent("机器人，帮我看看？")
@@ -2241,6 +2556,8 @@ class RuntimeLLMTests(unittest.TestCase):
             bot_aliases=["机器人"],
             score_threshold_reply=0.55,
             score_threshold_ignore=0.2,
+            llm_gate_enabled=False,
+            llm_gate_fallback_score=1.0,
         )
         runtime = QianjiLingqueRuntime(context, config)
         event = FakeGroupEvent(

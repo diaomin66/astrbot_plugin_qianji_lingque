@@ -8,7 +8,7 @@ SDK_PATH = Path(__file__).resolve().parents[1] / ".venv" / "Lib" / "site-package
 if SDK_PATH.exists():
     sys.path.insert(0, str(SDK_PATH))
 
-from qianji_lingque.llm import extract_completion_text, sanitize_reply
+from qianji_lingque.llm import extract_completion_text, parse_timing_gate_response, sanitize_reply
 
 try:
     from astrbot.api.provider import LLMResponse as AstrBotLLMResponse
@@ -63,6 +63,23 @@ class LLMParsingTests(unittest.TestCase):
         )
 
         self.assertEqual(extract_completion_text(response), "SDK 链路回复")
+
+    def test_parse_timing_gate_response_accepts_json_block(self) -> None:
+        result = parse_timing_gate_response(
+            '```json\n{"action":"reply","confidence":0.82,"reason":"像在求助"}\n```',
+            0.42,
+        )
+
+        self.assertEqual(result.action, "reply")
+        self.assertEqual(result.confidence, 0.82)
+        self.assertEqual(result.reason, "像在求助")
+        self.assertTrue(result.called_llm)
+
+    def test_parse_timing_gate_response_invalid_action_waits(self) -> None:
+        result = parse_timing_gate_response('{"action":"speak"}', 0.42)
+
+        self.assertEqual(result.action, "wait")
+        self.assertEqual(result.confidence, 0.42)
 
 
 if __name__ == "__main__":

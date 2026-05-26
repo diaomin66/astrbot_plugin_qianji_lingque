@@ -66,6 +66,26 @@
     "slider": {"min": 1, "max": 60, "step": 1},
     "hint": "用于清理长时间未收到 LLM 响应的 pending 状态。"
   },
+  "llm_gate_enabled": {
+    "description": "启用灰区 LLM 节奏判断",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，强求助灰区、常见疑问灰区或接近回复阈值的群聊会先调用一次轻量 TimingGate 判断是否该接话；低分消息和普通闲聊灰区不会调用模型。"
+  },
+  "llm_gate_timeout_seconds": {
+    "description": "灰区节奏判断超时",
+    "type": "float",
+    "default": 1.5,
+    "slider": {"min": 0.2, "max": 10, "step": 0.1},
+    "hint": "TimingGate 和第三方 runner 直发兜底的最长等待时间。强求助灰区超时会走本地兜底或放行默认链路，弱疑问和普通灰区会 wait，避免阻塞群聊主链路太久。"
+  },
+  "llm_gate_fallback_score": {
+    "description": "灰区本地兜底分数",
+    "type": "float",
+    "default": 0.4,
+    "slider": {"min": 0, "max": 1, "step": 0.01},
+    "hint": "带强求助信号的灰区消息达到该分数时，即使 TimingGate 低置信 wait/ignore、超时或不可用，也会本地兜底接话。弱疑问只进入 TimingGate，不会在节奏判断关闭时直接兜底。"
+  },
   "max_tracked_groups": {
     "description": "最多保留群状态数",
     "type": "int",
@@ -85,7 +105,7 @@
     "type": "float",
     "default": 0.78,
     "slider": {"min": 0, "max": 1, "step": 0.01},
-    "hint": "本地评分高于该值时直接回复；灰区消息会快速跳过或仅在被点名时回复。"
+    "hint": "本地评分高于该值时直接回复；灰区消息会按节奏判断或本地兜底决定是否接话。"
   },
   "score_threshold_ignore": {
     "description": "直接忽略分数阈值",
@@ -103,8 +123,8 @@
   "log_decisions_enabled": {
     "description": "输出读空气判定日志",
     "type": "bool",
-    "default": false,
-    "hint": "默认关闭。启用后会在 AstrBot 日志中输出读空气判定、是否计划/实际调用 LLM、动作、分数和原因；普通跳过日志使用 DEBUG，关键 LLM 生命周期使用 INFO。"
+    "default": true,
+    "hint": "默认开启。会在 AstrBot 日志中输出读空气判定、TimingGate 实际调用 LLM、ProviderRequest 正式回复实际调用 LLM、第三方 runner 直发兜底实际调用 LLM、动作、分数和原因；默认隐藏群聊原文，只记录长度。"
   },
   "log_message_excerpt_enabled": {
     "description": "日志包含消息摘要",

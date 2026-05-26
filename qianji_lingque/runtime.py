@@ -155,19 +155,102 @@ class QianjiLingqueRuntime:
         state.last_decision = f"{decision.action} ({decision.confidence:.2f})：{decision.reason}"
         final_action = decision.action
         final_reason = decision.reason
+        final_confidence = decision.confidence
+        timing_gate_called = False
+        direct_reply_text = ""
+        direct_reply_reason = ""
+        direct_reply_called = False
 
         if decision.is_gray_area:
             if _wants_bot(event, snapshot):
                 final_action = "reply"
                 final_reason = "灰区消息被点名或唤醒，交给 AstrBot 会话模型。"
+            elif not self.config.llm_gate_enabled:
+                if _gray_local_fallback_should_reply(decision, snapshot, self.config):
+                    final_action = "reply"
+                    final_confidence = _local_fallback_confidence(decision)
+                    final_reason = "灰区消息带求助信号，节奏判断关闭时本地兜底接话。"
+                else:
+                    final_action = "wait"
+                    final_reason = "灰区消息，轻量节奏判断已关闭，本轮不调用模型。"
+            elif not _gray_message_is_worth_llm_gate(decision, snapshot, self.config):
+                if _gray_local_fallback_should_reply(decision, snapshot, self.config):
+                    final_action = "reply"
+                    final_confidence = _local_fallback_confidence(decision)
+                    final_reason = "灰区消息带求助信号，本地兜底接话。"
+                else:
+                    final_action = "wait"
+                    final_reason = "灰区消息缺少求助信号，本轮不调用模型。"
             else:
-                final_action = "wait"
-                final_reason = "灰区消息，为避免阻塞插件链，本轮不调用模型。"
-            state.last_decision = f"{final_action} ({decision.confidence:.2f})：{final_reason}"
+                if not await self.llm_client.reply_request_supported(event):
+                    unsupported_reason = self.llm_client.last_error or "当前回复链路不可用"
+                    if _gray_local_fallback_should_reply(decision, snapshot, self.config):
+                        direct_reply_reason = f"灰区节奏判断未调用，主动回复链路不可用，改用直发兜底：{unsupported_reason}"
+                        direct_reply_result = await self.llm_client.generate_direct_reply(
+                            event,
+                            decision_snapshot,
+                            state,
+                            decision_reason=direct_reply_reason,
+                            timeout_seconds=self.config.llm_gate_timeout_seconds,
+                        )
+                        direct_reply_text = direct_reply_result.text
+                        direct_reply_called = direct_reply_result.called_llm
+                        if direct_reply_text:
+                            final_action = "reply"
+                            final_confidence = _local_fallback_confidence(decision)
+                            final_reason = direct_reply_reason
+                        else:
+                            final_action = "wait"
+                            final_reason = (
+                                f"灰区节奏判断未调用，直发兜底失败，本轮放行默认链路但默认链路未必会回复"
+                                f"（明确点名={'是' if _wants_bot(event, snapshot) else '否'}）："
+                                f"{direct_reply_result.reason or unsupported_reason}"
+                            )
+                    else:
+                        final_action = "wait"
+                        final_reason = (
+                            f"灰区节奏判断未调用，本轮放行默认链路但默认链路未必会回复"
+                            f"（明确点名={'是' if _wants_bot(event, snapshot) else '否'}）：{unsupported_reason}"
+                        )
+                else:
+                    timing_result = await self.llm_client.judge_timing(
+                        event,
+                        decision_snapshot,
+                        state,
+                        local_score=decision.confidence,
+                        local_reason=decision.reason,
+                        mode_label=mode_label(_effective_mode(self.config, snapshot.group_id, group_key)),
+                        timeout_seconds=self.config.llm_gate_timeout_seconds,
+                    )
+                    timing_gate_called = timing_result.called_llm
+                    final_action = timing_result.action
+                    final_confidence = timing_result.confidence
+                    final_reason = f"灰区 TimingGate：{timing_result.reason}"
+                    should_fallback_after_gate = (
+                        final_action != "reply"
+                        and _timing_gate_should_fallback(timing_result, decision, snapshot, self.config)
+                        and _gray_local_fallback_should_reply(decision, snapshot, self.config)
+                    )
+                    if should_fallback_after_gate:
+                        final_action = "reply"
+                        final_confidence = _local_fallback_confidence(decision)
+                        final_reason = f"灰区 TimingGate 后本地兜底接话：{timing_result.reason}"
+                    self._log_lifecycle(
+                        "TimingGate节奏判断",
+                        event,
+                        group_id=group_key,
+                        detail=(
+                            f"实际调用LLM={'是' if timing_gate_called else '否'}；"
+                            f"TimingGate动作={timing_result.action}；最终动作={final_action}；"
+                            f"TimingGate分数={timing_result.confidence:.2f}；最终分数={final_confidence:.2f}；"
+                            f"原因={timing_result.reason}"
+                        ),
+                    )
+            state.last_decision = f"{final_action} ({final_confidence:.2f})：{final_reason}"
         elif final_action == "wait" and _wants_bot(event, snapshot):
             final_action = "reply"
             final_reason = "消息被点名或唤醒，交给 AstrBot 会话模型。"
-            state.last_decision = f"{final_action} ({decision.confidence:.2f})：{final_reason}"
+            state.last_decision = f"{final_action} ({final_confidence:.2f})：{final_reason}"
 
         if (
             final_action == "reply"
@@ -196,8 +279,9 @@ class QianjiLingqueRuntime:
                 event,
                 action=final_action,
                 will_call_llm=False,
+                timing_gate_called=timing_gate_called,
                 reason=final_reason,
-                confidence=decision.confidence,
+                confidence=final_confidence,
                 group_id=snapshot.group_id,
                 state_group_id=group_key,
                 text=snapshot.text,
@@ -206,11 +290,62 @@ class QianjiLingqueRuntime:
                 yield None
             return
 
+        if direct_reply_text:
+            token = uuid.uuid4().hex
+            previous_streaming = _get_raw_extra(event, "enable_streaming")
+            had_send_before = _event_has_send_operation(event)
+            state.append_user_message(decision_snapshot)
+            state.last_decision = f"reply ({final_confidence:.2f})：{final_reason}"
+            _set_pending_payload(
+                event,
+                {
+                    "group_id": group_key,
+                    "token": token,
+                    "request_id": 0,
+                    "confidence": final_confidence,
+                    "reason": final_reason,
+                    "is_direct": True,
+                    "had_send_before": had_send_before,
+                },
+            )
+            self._pending_replies[token] = PendingReply(
+                group_id=group_key,
+                token=token,
+                confidence=final_confidence,
+                reason=final_reason,
+                is_direct=True,
+                started_at=time.time(),
+                request_id=0,
+                status="responded",
+                response_text=direct_reply_text,
+                previous_streaming=previous_streaming,
+                had_send_before=had_send_before,
+            )
+            self._pending_events[token] = event
+            self._sync_protected_context_groups()
+            self._schedule_send_confirmation_expiry(token)
+            self._log_decision(
+                event,
+                action="reply",
+                will_call_llm=False,
+                timing_gate_called=timing_gate_called,
+                reason=f"{final_reason}；回复链路=直发；直发LLM实际={'是' if direct_reply_called else '否'}。",
+                confidence=final_confidence,
+                group_id=snapshot.group_id,
+                state_group_id=group_key,
+                text=snapshot.text,
+            )
+            try:
+                yield event.plain_result(direct_reply_text)
+            finally:
+                event.stop_event()
+            return
+
         wants_bot = _wants_bot(event, snapshot)
         take_over_event = self._should_take_over_event(event, snapshot)
         pending = self._blocking_pending(group_key, wants_bot, take_over_event)
         if pending:
-            state.last_decision = f"wait ({decision.confidence:.2f})：同群已有回复生成中。"
+            state.last_decision = f"wait ({final_confidence:.2f})：同群已有回复生成中。"
             if _should_record_context(decision):
                 state.append_user_message(decision_snapshot)
             suppress_default = take_over_event or bool(getattr(event, "is_at_or_wake_command", False))
@@ -219,7 +354,7 @@ class QianjiLingqueRuntime:
                 action="wait",
                 will_call_llm=False,
                 reason="同群已有回复生成中，本轮不再调用 LLM。",
-                confidence=decision.confidence,
+                confidence=final_confidence,
                 group_id=snapshot.group_id,
                 state_group_id=group_key,
                 text=snapshot.text,
@@ -238,7 +373,7 @@ class QianjiLingqueRuntime:
         self._pending_replies[token] = PendingReply(
             group_id=group_key,
             token=token,
-            confidence=decision.confidence,
+            confidence=final_confidence,
             reason=final_reason,
             is_direct=wants_bot,
             started_at=time.time(),
@@ -295,7 +430,7 @@ class QianjiLingqueRuntime:
                 "group_id": group_key,
                 "token": token,
                 "request_id": request_id,
-                "confidence": decision.confidence,
+                "confidence": final_confidence,
                 "reason": final_reason,
                 "is_direct": wants_bot,
                 "had_send_before": had_send_before,
@@ -305,7 +440,7 @@ class QianjiLingqueRuntime:
         self._pending_replies[token] = PendingReply(
             group_id=group_key,
             token=token,
-            confidence=decision.confidence,
+            confidence=final_confidence,
             reason=final_reason,
             is_direct=wants_bot,
             started_at=time.time(),
@@ -319,17 +454,18 @@ class QianjiLingqueRuntime:
         state.append_user_message(decision_snapshot)
         self._schedule_pending_expiry(token, replace=True)
         _suppress_default_llm(event)
-        state.last_decision = f"reply ({decision.confidence:.2f})：{final_reason}"
+        state.last_decision = f"reply ({final_confidence:.2f})：{final_reason}"
         self._log_decision(
             event,
             action="reply",
             will_call_llm=True,
             reason=final_reason,
-            confidence=decision.confidence,
+            confidence=final_confidence,
             group_id=snapshot.group_id,
             state_group_id=group_key,
             text=snapshot.text,
             request_id=request_id,
+            timing_gate_called=timing_gate_called,
         )
         try:
             yield reply_request
@@ -917,7 +1053,8 @@ class QianjiLingqueRuntime:
             f"当前群：{group_id or '未知'}\n"
             f"总开关：{'开启' if self.config.enabled else '关闭'}\n"
             f"群开关：{'开启' if enabled else '关闭'}\n"
-            f"模式：{mode_label(effective_mode)}"
+            f"模式：{mode_label(effective_mode)}\n"
+            f"灰区节奏判断：{'开启' if self.config.llm_gate_enabled else '关闭'}"
         )
 
     def enable_group(self, event: Any) -> str:
@@ -1015,6 +1152,7 @@ class QianjiLingqueRuntime:
         state_group_id: str = "",
         text: str = "",
         request_id: int = 0,
+        timing_gate_called: bool | None = None,
     ) -> None:
         if not self.config.log_decisions_enabled:
             return
@@ -1022,9 +1160,13 @@ class QianjiLingqueRuntime:
         state_group_id = state_group_id or group_id
         score = "无" if confidence is None else f"{confidence:.2f}"
         extra = f" request_id={request_id}" if request_id else ""
-        log_method = logger.info if will_call_llm else logger.debug
-        log_method(
-            "[千机聆阙] 判定 动作=%s 计划调用LLM=%s 分数=%s 群=%s 状态key=%s 平台=%s 发送者=%s 原因=%s 消息=%s%s",
+        timing_extra = (
+            ""
+            if timing_gate_called is None
+            else f" 节奏LLM实际={'是' if timing_gate_called else '否'}"
+        )
+        logger.info(
+            "[千机聆阙] 判定 动作=%s 计划正式回复LLM=%s 分数=%s 群=%s 状态key=%s 平台=%s 发送者=%s 原因=%s 消息=%s%s%s",
             action,
             "是" if will_call_llm else "否",
             score,
@@ -1034,6 +1176,7 @@ class QianjiLingqueRuntime:
             _event_sender_id(event) or "未知",
             _compact_log_text(reason, 160),
             self._log_message_summary(text or _message_text_from_event(event)),
+            timing_extra,
             extra,
         )
 
@@ -1359,6 +1502,186 @@ def _should_record_context(decision: Any) -> bool:
 
 def _wants_bot(event: Any, snapshot: Any) -> bool:
     return bool(snapshot.is_direct_to_bot or getattr(event, "is_at_or_wake_command", False))
+
+
+def _timing_gate_should_fallback(
+    result: Any,
+    decision: Any,
+    snapshot: Any,
+    config: PluginConfig,
+) -> bool:
+    action = str(getattr(result, "action", "") or "")
+    if not getattr(result, "called_llm", False):
+        return True
+    reason = str(getattr(result, "reason", "") or "")
+    if any(marker in reason for marker in ("超时", "失败", "无效", "非 JSON")):
+        return True
+    confidence = _safe_float(getattr(result, "confidence", None), decision.confidence)
+    low_confidence_ceiling = max(0.55, min(0.72, config.llm_gate_fallback_score + 0.25))
+    return action in {"wait", "ignore"} and confidence <= low_confidence_ceiling
+
+
+def _gray_message_is_worth_llm_gate(decision: Any, snapshot: Any, config: PluginConfig) -> bool:
+    if not config.llm_gate_enabled:
+        return False
+    if _gray_local_fallback_should_reply(decision, snapshot, config):
+        return True
+    if _gray_weak_question_should_use_llm_gate(decision, snapshot, config):
+        return True
+    span = max(config.score_threshold_reply - config.score_threshold_ignore, 0.01)
+    gray_position = (decision.confidence - config.score_threshold_ignore) / span
+    return gray_position >= 0.65
+
+
+def _gray_local_fallback_should_reply(decision: Any, snapshot: Any, config: PluginConfig) -> bool:
+    if snapshot.is_direct_to_bot:
+        return True
+    text = snapshot.text.strip()
+    if _looks_like_casual_non_question(text):
+        return False
+    if not _has_strong_reply_signal(text):
+        return False
+    return decision.confidence >= config.llm_gate_fallback_score
+
+
+def _gray_weak_question_should_use_llm_gate(decision: Any, snapshot: Any, config: PluginConfig) -> bool:
+    text = snapshot.text.strip()
+    if _looks_like_casual_non_question(text):
+        return False
+    if not _looks_like_question_signal(text):
+        return False
+    return decision.confidence >= config.llm_gate_fallback_score
+
+
+def _has_strong_reply_signal(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    strong_markers = (
+        "帮我",
+        "帮忙",
+        "求助",
+        "帮看",
+        "帮看看",
+        "帮我看",
+        "帮忙看",
+        "怎么办",
+        "咋办",
+        "如何",
+        "怎么",
+        "为什么",
+        "什么",
+        "啥",
+        "咋回事",
+        "咋弄",
+        "咋整",
+        "哪里",
+        "哪儿",
+        "哪个",
+        "哪种",
+        "哪位",
+        "哪边",
+        "在哪",
+        "能不能",
+        "可不可以",
+        "行不行",
+        "有办法",
+    )
+    if any(marker in stripped for marker in strong_markers):
+        return True
+    return (
+        _looks_like_contextual_followup_question(stripped)
+        or _looks_like_structured_what_question(stripped)
+        or _looks_like_take_a_look_request(stripped)
+    )
+
+
+def _looks_like_question_signal(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped or len(stripped) > 48:
+        return False
+    weak_fillers = {"是么", "是吗", "那呢", "啊", "哦", "嗯", "额"}
+    if stripped in weak_fillers:
+        return False
+    if any(marker in stripped for marker in ("?", "？")):
+        return True
+    strong_question_markers = ("是否", "是不是", "有没有", "要不要", "该不该", "会不会", "需不需要", "能否")
+    if any(marker in stripped for marker in strong_question_markers):
+        return True
+    if stripped.endswith(("吗", "么")):
+        return True
+    if _looks_like_contextual_followup_question(stripped):
+        return True
+    return False
+
+
+def _looks_like_contextual_followup_question(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped or len(stripped) > 8:
+        return False
+    if not stripped.endswith(("呢", "吗", "么", "？", "?")):
+        return False
+    return stripped.startswith(("这", "那", "这个", "那个", "它", "他", "她"))
+
+
+def _looks_like_structured_what_question(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped or len(stripped) > 24:
+        return False
+    markers = (
+        "是什么",
+        "什么是",
+        "啥是",
+        "是啥",
+        "什么意思",
+        "什么情况",
+        "什么原因",
+        "什么问题",
+        "什么办法",
+        "为啥",
+    )
+    return any(marker in stripped for marker in markers)
+
+
+def _looks_like_take_a_look_request(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped or len(stripped) > 24:
+        return False
+    if stripped.startswith(("我看下", "我看一下", "我看看")):
+        return False
+    return stripped.startswith(("看下", "看一下", "看看")) or any(
+        marker in stripped for marker in ("你看下", "你看一下", "帮我看看", "帮忙看看")
+    )
+
+
+def _looks_like_casual_non_question(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    casual_exact = {"没什么", "一起玩吗", "好呢", "行呢", "可以呢", "是吗", "是么", "那呢"}
+    if stripped in casual_exact:
+        return True
+    casual_prefixes = ("没什么", "没啥", "没事", "无所谓")
+    if stripped.startswith(casual_prefixes):
+        return True
+    casual_markers = ("没什么", "没啥", "有什么好", "有啥好", "一起玩吗")
+    if any(marker in stripped for marker in casual_markers):
+        return True
+    if len(stripped) <= 8 and any(stripped.startswith(prefix) for prefix in ("好呢", "行呢", "可以呢")):
+        return True
+    return False
+
+
+def _local_fallback_confidence(decision: Any) -> float:
+    confidence = _safe_float(getattr(decision, "confidence", None), 0.0)
+    return max(confidence, min(0.72, confidence + 0.16))
+
+
+def _safe_float(value: Any, fallback: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _suppress_default_llm(event: Any) -> None:

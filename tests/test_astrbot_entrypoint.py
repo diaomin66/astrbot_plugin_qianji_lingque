@@ -102,6 +102,19 @@ class AstrBotEntrypointSmokeTests(unittest.TestCase):
                 names = set(command_filter.get_complete_command_names())
                 assert any(name.startswith("读空气 ") for name in names)
                 assert any(name.startswith("空气 ") for name in names)
+                if handler_name == "lingque_enable":
+                    assert "空气 开" in names
+                if handler_name == "lingque_disable":
+                    assert "空气 关" in names
+                if handler_name == "lingque_mode":
+                    assert "空气 模" in names
+
+            status_handler = next(item for item in handlers if item.handler_name == "lingque_status")
+            status_names = set(next(item for item in status_handler.event_filters if hasattr(item, "get_complete_command_names")).get_complete_command_names())
+            assert "空气 查" in status_names
+            reason_handler = next(item for item in handlers if item.handler_name == "lingque_reason")
+            reason_names = set(next(item for item in reason_handler.event_filters if hasattr(item, "get_complete_command_names")).get_complete_command_names())
+            assert "空气 因" in reason_names
 
             class Conv:
                 cid = "conv-1"
